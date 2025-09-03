@@ -1,0 +1,2754 @@
+# .cursorrules
+# CursorAI orchestration & codegen spec for rl-crypto-tennis project
+# (Complete file with Robinhood Crypto Trading integration wired end-to-end)
+# Grok feedback applied + SQL scripts added + Twilio/Slack chat + ENV→DB precedence + actions/withdrawals.
+# Kraken Spot WS + REST trading added (ccxt + WS v2); symbol mapping BTC→XBT; endpoints + tests + metrics.
+
+standards:
+  safety_and_modes:
+    default_mode: "paper"
+    pipeline_stages: ["train", "backtest", "paper", "live"]
+    submodes:
+      paper.dry_run: true
+      paper.dry_run_timeout_sec: 600
+      paper.dry_run_ws_reconnect:
+        max_backoff_sec: 60
+        jitter: true
+    idempotency: "All POST job endpoints accept client-supplied idempotency keys; repeated requests no-op."
+    paper_vs_live_invariants:
+      - "Identical risk Sizer (fractional-Kelly with caps) across modes."
+      - "Identical fee/spread/slippage models between backtest and paper; live augments with realized fills and logs modeled-vs-realized deltas for audit."
+      - "Live requires config.flag live.enabled=true AND non-empty, validated exchange credentials; kill-switch endpoint available."
+    live_guardrails:
+      - "Dry-run flag must be false"
+      - "Venue credentials present and verified"
+      - "Live toggle enabled at global + bot scope"
+      - "Parlay tickets confirm odds freeze/expiry windows"
+
+  data_integrity:
+    embargo_defaults:
+      crypto: { rolling_embargo_frac: 0.05, min_bars: 500 }
+      tennis: { rolling_embargo_frac: 0.03, min_events: 50 }
+    leakage_guards:
+      - "Shift all features by +1 BEFORE any PACF/RFE/VIF/lag-expansion/selection to align X_t with y_{t+1}."
+      - "PACF on lag1 only (TRAIN) → gate base columns → generate lag grid via lag_expansion before RFE/VIF/PCA."
+      - "Fit scalers/transformers/selectors on TRAIN only; persist and reuse on VAL/TEST/PAPER/LIVE."
+      - "Purged k-fold CV and walk-forward (expanding or rolling) with embargo windows."
+      - "Cache TheOddsAPI responses and always read odds from cache for model inputs; API fetch runs on a separate task."
+    reproducibility:
+      - "All jobs record seeds, package versions, git SHA, CUDA/cuDNN, GPU/CPU info."
+      - "MLflow experiment tracking + artifact registry pointer in Postgres."
+      - "Optional DVC hooks for dataset versioning (off by default) at ./data/dvc"
+    validation:
+      log_embargo_violations: true
+
+  costs_and_risk:
+    costs_model:
+      crypto_default_bps: { taker_bps: 6, maker_bps: 2 }
+      robinhood_crypto: "0% commission; effective cost = |exec - mid|/mid; log per-fill."
+      sportsbook:
+        betfair_commission_pct: 2
+        sporttrade_commission_pct: 2
+        novig_commission_pct: 0
+      slippage_model: "volatility-scaled impact with venue-specific fill probability; fit from paper fills; rule-based fallback."
+      borrow_rates: "Optional; if shorting enabled, deduct borrow_daily_bps * holding_days."
+      borrow_default_daily_bps: 10
+    position_limits:
+      leverage_allowed: false
+      shorting_allowed:
+        paper: true
+        live_default: false
+        per_instrument_venue_toggle: true
+      per_trade_cap_pct_of_equity: 2
+      daily_var_cap_pct: 5
+      fractional_kelly_default: 0.33
+      drawdown_brake:
+        trigger_dd_pct: 10
+        kelly_multiplier_on_trigger: 0.5
+        cooloff_bars: 1440
+        reset_after_bars: 10080
+
+  feature_engineering:
+    scalers: ["standard", "robust", "minmax", "none"]
+    defaults: { scaler: "robust" }
+    dimensionality_controls:
+      mode: "none"
+      pca:
+        enabled: false
+        pipeline: "pca_only"
+        n_components: null
+        explained_variance_ratio_target: 0.95
+        whiten: false
+        svd_solver: "auto"
+        random_state: 42
+        fit_scope: "TRAIN"
+        log_components: 20
+    pacf:
+      mode: "lag1_only"
+      apply_on: "features_post_shift"
+      max_lag: 1
+      allow_override: false
+      cache_results: true
+      threshold:
+        method: "ci_95"
+        min_abs_phi1: null
+    lag_expansion:
+      enabled: true
+      base_source: "features_post_shift"
+      gate_policy: "pacf_lag1"
+      max_lag: 128
+      grid: "sparse"
+      sparse_grid:
+        dense_head_k: 16
+        tail_geometric_ratio: 1.25
+      engine:
+        frame_lib: "polars"
+        parallel: true
+        n_jobs: "auto"
+        cache_intermediate: true
+      post_filters:
+        drop_near_zero_variance: true
+        corr_cluster_prune: { method: "spearman", threshold: 0.98 }
+      downstream_selection:
+        mode: "rfe_then_optional_pca"
+        rfe:
+          estimator: "lightgbm"
+          step: 0.2
+          min_features: 128
+          random_state: 42
+        pca:
+          enabled_if_features_gt: 2000
+          explained_variance_ratio_target: 0.95
+      limits:
+        max_features_after_expand: 12000
+        auto_reduce_if_exceeds: true
+    microstructure_fallbacks:
+      bid_ask_spread: "use mid-based proxy if L2 unavailable"
+      depth_imbalance: "fallback to last known depth or mark missing"
+      order_flow_imbalance: "proxy with signed volume if L2 missing"
+    crypto_feature_scripts:
+      comprehensive: "run_coin_comprehensive_analysis.py  # PACF(lag1) gate → lag_expansion → RFE/PCA"
+      pairwise: "run_pairwise_analysis.py                  # coin↔coin, coin↔stock pairing features"
+    indicators_to_compute_and_show:
+      trend_momentum: ["SMA9","SMA20","SMA50","EMA9","EMA20","EMA50","MACD","MACD_signal","MACD_hist","RSI14","StochK14","StochD3","ADX14"]
+      volatility: ["ATR14","BBANDS20_2","rolling_sigma20","realized_vol_EWMA","HV10","HV30"]
+      volume_flow: ["OBV","MFI14","VWAP","volume_zscore"]
+      microstructure: ["bid_ask_spread","depth_imbalance","order_flow_imbalance"]
+      risk: ["drawdown","rolling_sharpe_EW","VaR","ES"]
+      costs: ["est_fee_bps","effective_spread_bps","realized_slippage_bps"]
+
+  models_and_algorithms:
+    rl_structure:
+      type: "multi_agent_hierarchical"
+      levels:
+        base: "Per‑algo/domain agents (TD3, PPO, DT, Stat‑Arb)"
+        intermediate: "Domain aggregators (crypto: gnn_forecaster; tennis: benter/copula)"
+        master: "Master policy (e.g., SAC) to size/approve actions"
+      fallbacks: ["ensemble_stacking"]
+    rl_algorithms:
+      - { key: "td3", role: "continuous sizing; twin critics; delayed policy; target smoothing" }
+      - { key: "ppo", role: "robust on-policy baseline" }
+      - { key: "sac", role: "entropy-regularized continuous control" }
+      - { key: "dt",  role: "Decision Transformer for offline RL" }
+      - { key: "stat_arb", role: "mean-reversion spread with RL entries/exits (no OU assumption)" }
+      - { key: "llm_explainer_rag", role: "RAG-based rationale generator for trades/bets (Llama-13B + FAISS)" }
+    forecasting_modules:
+      - { key: "crypto_vae", role: "distributional forecasting (quantiles; CRPS) feeding VaR/ES & sizing" }
+      - { key: "gnn_forecaster", role: "spatio-temporal forecaster with spillover graphs" }
+      - { key: "lag_llama", role: "time-series foundation model (Lag-Llama style) for direction/vol ensemble" }
+    baselines: ["XGBoost","LSTM","SARIMA","Prophet","Multi-ML BTC reference"]
+    tennis:
+      probability_calibration: "Benter-style logistic blend vs market; fractional-Kelly staking"
+      parlays:
+        correlation_mode: ["independent","copula"]
+        default: "independent"
+        copula_lib: "copulae"
+        copula:
+          family: "gaussian"
+          alt_families: ["clayton"]
+          regularization_eps: 1.0e-6
+          rank_correlation_basis:
+            by: ["surface","tournament","window_days"]
+            window_days: 30
+      momentum_signals:
+        enabled: true
+        source: "point-by-point ML momentum model (GBDT) with server/point_no/ranking_gap"
+        window_points: 32
+        emit_as_features_to: ["benter_adjust","llm_explainer_rag","tennis_benter_logit"]
+        notes: "Dominant drivers include server and point progression."
+    anomaly_detection:
+      pygod:
+        detectors: ["DOMINANT","GRADE","CONAD"]
+        normalization:
+          method: "zscore_per_detector"
+          window_days: 30
+          ensemble: "median"
+        thresholds: { info_z: 1.5, warning_z: 2.5, critical_z: 3.5 }
+        kelly_throttle:
+          enabled: true
+          percentile_to_multiplier: { "p90": 0.75, "p95": 0.5, "p99": 0.25 }
+
+  routing_and_execution:
+    expected_cost_router:
+      policy_modes: ["profit_max","min_total_cost"]
+      features: ["maker_taker_fee","effective_spread","slippage_model","fill_rate","uptime","tier0_eligibility"]
+      venue_priority: "Choose venue with highest expected net PnL; prefer Tier-0 when spread competitive"
+      failover: "If chosen venue degraded, retry next venue by ranking."
+      health_checks:
+        latency_ms_slo: 500
+        ws_heartbeat_max_sec: 5
+        auth_ok: true
+        timeout_sec: 5
+      tier0_eligibility_criteria:
+        uptime_pct_min: 99.0
+        avg_spread_percentile_max: 50
+      fill_probability_model:
+        method: "hybrid"
+        historical_features: ["avg_fill_rate_30d","spread_bps_avg_30d","latency_ms","volatility_1m"]
+        realtime_features: ["current_spread_bps","size_vs_top_of_book","recent_fills_5m","venue_uptime_pct_30d"]
+        model_selection: "logistic_if_fills_le_1000_else_xgboost"
+        masking: "use only fill outcomes strictly prior to decision_time"
+        training_data: "paper fills (sim) + live fills (masked), per venue/symbol"
+        fallback: "rule_based_by_spread_and_size"
+    paper_engine:
+      tick_source: "WS snapshots with throttling; fills via stochastic L2-free model calibrated on spreads and realized slippage"
+
+  # 🔐 Integration spec: Robinhood Crypto Trading (doc-aligned) + Kraken Spot
+  integrations:
+    robinhood_crypto:
+      base_url: "https://trading.robinhood.com"
+      auth:
+        algorithm: "Ed25519"
+        signing_headers: ["x-api-key","x-signature","x-timestamp"]   # used for auth only
+        default_headers: ["accept: application/json","content-type: application/json"]  # standard JSON headers (not signed)
+        timestamp_unit: "seconds"
+        string_to_sign: "api_key + timestamp + path(+canonical_query) + method + body"
+        body_json_serializer: "json.dumps(obj, separators=(\",\", \":\"), sort_keys=True)"
+      endpoints:
+        accounts:        "GET /api/v1/crypto/trading/accounts/"
+        trading_pairs:   "GET /api/v1/crypto/trading/trading_pairs/?symbol=..."
+        holdings:        "GET /api/v1/crypto/trading/holdings/?asset_code=..."
+        best_bid_ask:    "GET /api/v1/crypto/marketdata/best_bid_ask/?symbol=..."
+        estimated_price: "GET /api/v1/crypto/marketdata/estimated_price/?symbol=...&side=bid|ask|both&quantity=Q1,Q2"
+        create_order:    "POST /api/v1/crypto/trading/orders/"
+        cancel_order:    "POST /api/v1/crypto/trading/orders/{order_id}/cancel/"
+        get_order:       "GET /api/v1/crypto/trading/orders/{order_id}/"
+        list_orders:     "GET /api/v1/crypto/trading/orders/"
+      symbols:
+        format: "BASE-QUOTE (e.g., BTC-USD)"
+        mapper: "internal 'BTC/USDT' → 'BTC-USD' (configurable)"
+      idempotency:
+        field: "client_order_id"
+        scope: "create_order"
+      notes:
+        - "Cancel uses POST (not DELETE)."
+        - "Sign path including querystring; sort query params for canonicalization."
+        - "Body is exact serialized JSON used in request."
+    kraken_spot:
+      description: "Kraken Spot — public WebSocket v2 (market data) + REST trading via ccxt"
+      ws:
+        url: "wss://ws.kraken.com/v2"
+        channels: ["ticker","book","trade"]
+        reconnect_backoff: { base_ms: 500, max_ms: 15000, jitter: true }
+        ping_interval_sec: 25
+        symbol_notes: "Use 'XBT' instead of 'BTC' (e.g., XBT/USDT)."
+      rest:
+        lib: "ccxt.kraken (sync; wrapped with anyio.to_thread)"
+        endpoints: ["fetch_balance","fetch_ticker","create_order","cancel_order","fetch_open_orders"]
+        margin_params: ["leverage"]   # Kraken margin shorting via leverage param; guardrails apply
+    twilio_sms:
+      description: "Two-way SMS → Llama-13 chat router"
+      deps: ["twilio"]
+      env:
+        - TWILIO_SID
+        - TWILIO_TOKEN
+        - TWILIO_FROM
+      webhook: "POST /notify/twilio/inbound"   # Twilio will call this; we validate X-Twilio-Signature
+      outbound: "send_sms(from, to, text)"
+      rate_limit_rpm: 30
+    slack_app:
+      description: "Slack bot with DM (private chat) + optional channel subscriptions"
+      deps: ["slack_sdk"]
+      env:
+        - SLACK_BOT_TOKEN
+        - SLACK_CRYPTO_CLIENT_ID
+        - SLACK_TENNIS_CLIENT_ID
+        - SLACK_CRYPTO_WEBHOOK
+        - SLACK_TENNIS_WEBHOOK
+      endpoints:
+        events: "POST /notify/slack/events"     # Events API endpoint (or use Socket Mode)
+        command: "POST /notify/slack/command"   # Slash commands (/edge, /subscribe, /unsubscribe)
+        subscribe: "POST /notify/slack/subscribe"
+        unsubscribe: "POST /notify/slack/unsubscribe"
+      privacy:
+        mode: "DM-by-default"                   # private chats preferred; ephemeral in channel supported
+
+qa:
+  invariants:
+    - "Features are shifted by +1 before PACF/selection; labels are y_{t+1}."
+    - "PACF executed at lag=1 only; no multi-lag PACF."
+    - "Scalers/PCA/selector fitted on TRAIN only; transform reused elsewhere."
+    - "Kelly sizing ≤ bot.kelly_cap AND ≤ global.kelly_cap."
+    - "All ROI/P&L deducts fees/spread/slippage."
+    - "Adapters pass auth/ping/cancel in paper before live."
+    - "Odds cache used for tennis model inputs; API responses retained."
+    - "lag_expansion.max_lag ≤ available bars (TRAIN)."
+    - "Twilio requests are signature-validated; Slack events are verified."
+  tests:
+    adapters: ["auth-dummy","paper-place/cancel","effective-cost-compute","route-by-expected-cost",
+               "robinhood-signature-ed25519-test","robinhood-accounts-endpoint-ok","robinhood-create-cancel-order-flow",
+               "kraken-rest-create-cancel-smoke","kraken-ws-subscribe-ticker"]
+    router:
+      - "dry_run_cost_delta_logged"
+      - "failover_never_worse_expected_cost"
+      - "health_check_timeouts_observed"
+    chaos:
+      - "ws_disconnect_recover_with_backoff"
+      - "high_latency_venue_failover_triggers"
+    augmentation: ["distributional parity (bootstrap)","GAN drift check","leakage tests"]
+    e2e: ["BTC 7d 1m → train TD3/DT few steps → vector backtest → paper sim; deterministic seed"]
+    tennis:
+      - "Benter fit & odds cache replay"
+      - "copula_numeric_stability"
+      - "sportsbooks_list_and_select_ok"
+      - "odds_levels_match_set_game_fetch_ok"
+      - "tennis_csv_ingest_and_elo_merge"
+      - "faiss_knn_retrieval_accuracy_k5"
+      - "knn_granularity_accuracy_hourly_daily_weekly_monthly"
+      - "knn_embedding_consistency"
+      - "knn_update_cadence_ok"
+      - "knn_latency_ms_bounded"
+    crypto:
+      - "crypto_knn_similarity_accuracy_k5"
+      - "crypto_knn_daily_update_ok"
+      - "crypto_knn_latency_ms_bounded"
+    anomalies:
+      - "PyGOD fit/predict; thresholds and kelly throttle"
+    feature_pipeline:
+      - "features_shifted_before_pacf"
+      - "pacf_lag1_only_enforced"
+      - "lag_expansion_alignment_ok"
+      - "lag_expansion_sparse_grid_correct"
+      - "lag_expansion_limits_respected"
+      - "pca_evr_target_satisfied_or_warn"
+      - "classic_vs_pca_same_labeling_shape"
+    auth_signup:
+      - "unique_email_enforced"
+      - "password_policy_enforced"
+      - "verify_token_flow_ok"
+      - "password_rotation_policy_respected"
+    webhooks:
+      - "twilio_signature_validated"
+      - "slack_event_verified"
+    data_scale:
+      - "hf_crypto_1m_load_test_realistic_window"
+      - "gnn_small_graph_mem_budget_3060_12gb"
+    multi_agent:
+      - "credit_assignment_ok"
+      - "parallel_training_latency_bounded"
+      - "domain_fusion_accuracy"
+
+project:
+  name: rl-crypto-tennis
+  description: >
+    Multi-domain RL platform (Crypto & Tennis) focused on net-ROI with risk controls.
+    Unified pipeline: offline → backtest → paper → optional live. Dual backends (crypto:8000, tennis:9000).
+    Router with fee/spread/slippage modeling. Tennis Benter calibration + parlays (match/set/game odds).
+    RAG explainer (Llama-13B + FAISS) for trade/bet rationales. FAISS KNN for tennis & crypto (multi-granularity).
+    Twilio SMS & Slack private chat to Llama‑13.
+    Regulatory disclaimer: "Users are responsible for complying with local financial & gambling laws."
+  languages: [python, typescript]
+  repos:
+    - { name: backend_py, language: python }
+    - { name: dashboard_web, language: typescript }
+  domain_modes: ["crypto","sports-tennis"]
+  docker_support: true
+  phased_implementation:
+    goals:
+      mvp: ["crypto_td3","crypto_dt","crypto_ppo","crypto_sac","stat_arb","tennis_benter",
+            "anomalies_pygod","gnn_forecaster","crypto_vae","lag_llama","llm_explainer_rag",
+            "tennis_parlays_copula","tennis_knn_faiss","crypto_knn_faiss","auth_signup_verify",
+            "theoddsapi_live_levels","dual_backends_dashboard","twilio_sms","slack_private_chat"]
+    notes: "MVP enables ALL algorithms/modules per directive."
+
+build:
+  python:
+    runtime: "Python 3.11"
+    deps:
+      - fastapi==0.110.*
+      - fastapi-limiter               # optional rate limiting middleware
+      - redis                         # backend for fastapi-limiter (async redis)
+      - uvicorn
+      - pydantic==2.*
+      - sqlalchemy
+      - alembic
+      - psycopg[binary]
+      - httpx
+      - websockets
+      - python-socketio
+      - orjson
+      - cryptography
+      - passlib[bcrypt]
+      - pyyaml
+      - numpy
+      - pandas
+      - polars
+      - numba
+      - scikit-learn>=1.2,<1.4
+      - ta
+      - mlflow
+      - prefect
+      - ccxt
+      - torch==2.4.*
+      - torchvision==0.19.*
+      - torchaudio==2.4.*
+      - torch-geometric>=2.5,<2.6
+      - stable-baselines3
+      - ray[default]
+      - rllib
+      - optuna
+      - statsmodels>=0.14,<0.16
+      - prophet
+      - xgboost
+      - lightgbm
+      - plotly
+      - prometheus-client
+      - opentelemetry-sdk                              # optional tracing
+      - opentelemetry-instrumentation-fastapi          # optional tracing
+      - opentelemetry-exporter-otlp-proto-http         # optional tracing
+      - structlog
+      - python-dotenv
+      - keyring
+      - pygod
+      - copulae
+      - sentencepiece
+      - accelerate
+      - transformers==4.43.*
+      - sentence-transformers>=2.6
+      - bitsandbytes==0.43.*
+      - faiss-gpu; platform_system != "Windows"
+      - faiss-cpu
+      - quantstats
+      - matplotlib
+      - pytest
+      - pytest-asyncio
+      - anyio
+      - freezegun
+      - hypothesis
+      - twilio
+      - slack_sdk
+    compat_notes: >
+      Prefer faiss-gpu on CUDA (Linux/WSL2); fallback to faiss-cpu. Llama-13B in 4‑bit typically fits RTX 3060 12GB.
+  web:
+    runtime: "Node 20"
+    framework: "Next.js (App Router) + Tailwind + TailAdmin"
+    deps:
+      - next
+      - react
+      - react-dom
+      - typescript
+      - zustand
+      - axios
+      - swr
+      - socket.io-client
+      - next-auth
+      - @auth/core
+      - jsonwebtoken
+      - recharts
+      - monaco-editor
+      - zod
+      - @types/react
+      - @types/node
+
+architecture:
+  services:
+    - name: api-crypto
+      responsibilities:
+        - Datasets & feature catalog (crypto)
+        - Train/backtest/paper/live (TD3/PPO/SAC/DT/Stat-Arb/CryptoVAE/GNN/lag-llama)
+        - FAISS KNN for symbols (daily+granularities)
+        - Exchange adapters (Binance.US, Coinbase Advanced, Kraken Pro, Robinhood Crypto)
+        - Expected-cost router; Paper engine; Prometheus metrics
+        - RAG explainer plugin host for crypto trade rationales
+        - Robinhood Crypto signing: Ed25519; signing headers x-api-key/x-signature/x-timestamp; base https://trading.robinhood.com (Accept/Content-Type set but not signed)
+        - Twilio webhook + Slack events routing (shared LLM gateway)
+    - name: api-tennis
+      responsibilities:
+        - Tennis datasets/odds cache (TheOddsAPI) + Benter calibrator + logit/probit plugin
+        - Train/backtest/paper for tennis bots; parlays (match/set/game)
+        - LLM RAG explainer (plugin) + momentum signals
+        - Tennis FAISS KNN (hourly/daily/weekly/monthly); Similar matches API
+        - Player CSV ingestion (ELO/stats)
+    - name: router-engine
+      responsibilities: [Expected cost compute, venue scorecards, failover]
+    - name: ws-hub
+      responsibilities: [WebSocket fanout: prices, indicators, backtests, paper fills, router, tennis odds, anomalies, KNN results]
+    - name: ingestor-polygon
+      responsibilities: [Polygon crypto+stock bars (1m), Parquet + feature cache]
+    - name: ingestor-tennis-players
+      responsibilities: [Ingest player CSVs (ELO/stats/form), write to Postgres + FAISS rebuild hooks]
+    - name: ingestor-crypto-symbols
+      responsibilities: [Aggregate daily/per-granularity symbol features → embed & update FAISS]
+    - name: gnn-forecaster
+      responsibilities:
+        - Build graphs (FSI/sub-FSI, coin nodes incl. USDT); ST-Conv inference; forecasts to api-crypto
+        - Spillover (VAR), prune by |spillover|≥0.05 & top-k=8; row-stochastic edges
+    - name: anomaly-service
+      responsibilities: [PyGOD detectors; alerts to RL and dashboard]
+    - name: multi_agent_rl_service
+      optional: true
+      responsibilities:
+        - Coordinate base/intermediate/master agents
+        - Orchestrate parallel training/inference (ray/rllib)
+        - Provide health/latency telemetry per agent level
+  api_core_domain_prefix: "/api/{domain}"
+
+config:
+  front_end:
+    dual_backends:
+      enabled: true
+      crypto_api_url: "env:NEXT_PUBLIC_CRYPTO_API_URL|http://localhost:8000/api/crypto"
+      tennis_api_url: "env:NEXT_PUBLIC_TENNIS_API_URL|http://localhost:9000/api/tennis"
+      selection_mode: "manual"
+  global:
+    mode: "paper"
+    kelly_fraction: 0.33
+    kelly_cap_pct: 0.5
+    leverage_allowed: false
+    default_scaler: "robust"
+    feature_engineering:
+      prediction_target: "y_t+1"
+      pacf: { mode: "lag1_only", apply_on: "features_post_shift", max_lag: 1, threshold: "ci_95" }
+      lag_expansion:
+        max_lag: 128
+        grid: "sparse"
+        dense_head_k: 16
+        tail_geometric_ratio: 1.25
+    normalization_controls:
+      feature_scaler_options: ["standard","robust","minmax","none"]
+      anomaly_norm_options: ["zscore","robust"]
+      per_model_override_supported: true
+    augmentation: "auto"
+    algorithms:
+      td3: { enabled: true }
+      ppo: { enabled: true }
+      sac: { enabled: true }
+      dt:  { enabled: true }
+      stat_arb: { enabled: true }
+      crypto_vae: { enabled: true }
+      gnn_forecaster: { enabled: true }
+      lag_llama: { enabled: true }
+      llm_explainer_rag: { enabled: true }
+      benter_adjust: { enabled: true }
+    rl:
+      action_sets:
+        # Discrete sets are convenient for some algos; continuous_target works for TD3/SAC.
+        discrete_basic: ["HOLD","BUY_MKT","SELL_MKT","CLOSE_ALL","CANCEL_OPEN_ORDERS"]
+        discrete_with_short: ["HOLD","BUY_MKT","SELL_MKT","OPEN_SHORT","COVER_SHORT","CLOSE_ALL","CANCEL_OPEN_ORDERS"]
+        continuous_target: { mode: "position_target", range: [-1.0, 1.0] }  # -1 short; +1 long
+      default_action_set: "discrete_basic"
+      shorting_live_enabled_on: ["kraken"]  # guardrails; Binance.US spot has no live shorting
+    rl_hierarchy:
+      enabled: false
+      base_agents: ["td3","ppo","dt","stat_arb"]
+      intermediate: { crypto: "gnn_forecaster", tennis: "tennis_benter_logit" }
+      master: "sac"
+      reward_fusion: "weighted_ensemble"
+    routing:
+      policy: "profit_max"
+      venues: ["binanceus","coinbase","kraken","robinhood"]
+      prefer_tier0_when_spread_competitive: true
+      failover_allow_worse_expected_cost: false
+      require_manual_approval_if_worse_cost_bps: 0
+    data:
+      history_source: "polygon"
+      live_ws: ["binanceus","coinbase","kraken"]
+      stocks_source: "polygon"
+      stocks_source_fallbacks: ["robinhood"]
+      parquet_root: "./data/parquet"
+      cache_root: "./data/cache"
+      loaders: { chunk_size_rows: 2_000_000 }
+      validators:
+        horizon_vs_bar: "reject incompatible (e.g., 1h horizon with 1m bar without resampling)"
+    rag:
+      index_root: "./data/faiss/rag"
+      default_embed_model: "sentence-transformers/all-MiniLM-L6-v2"
+      split_strategy: { type: "chunk", size: 512, overlap: 64 }
+      generator_model: "meta-llama/Llama-2-13b-chat-hf"
+      quantization: "bnb-4bit"
+      # One Llama‑13 model; per‑sport RAG indexes (tennis/crypto) + general index
+      indexes:
+        general: "./data/faiss/rag/general"
+        tennis:  "./data/faiss/rag/tennis"
+        crypto:  "./data/faiss/rag/crypto"
+    gnn:
+      spillover:
+        method: "diebold_yilmaz_var"
+        window_days_daily: 30
+        window_hours_intraday: 168
+        min_abs_spillover: 0.05
+        top_k_edges: 8
+        edge_normalization: "row_stochastic"
+      graph_nodes:
+        core: ["FSI","FSI_LIQ","FSI_VOL","FSI_CREDIT","FSI_MARKET","BTC","ETH","USDT"]
+        selection:
+          mode: "top_mktcap"
+          top_n: 20
+          include_core: true
+      update_cadence_min: 60
+      node_selection_refresh_cadence_min: 60
+    tennis:
+      odds_source: "theoddsapi"
+      cache_ttl_seconds: 60
+      selected_sportsbooks: ["fanduel","draftkings"]
+      odds_levels_enabled: ["match","set","game"]
+      polling: { prematch_sec: 180, live_sec: 30 }
+      stake_sizing: { kelly_fraction: 0.33, kelly_cap_pct: 0.3 }
+      chat_languages: ["en","es","ru"]
+      knn:
+        k_default: 5
+        metric: "cosine"
+        embed_model: "sentence-transformers/all-MiniLM-L6-v2"
+        include_momentum_signals: true
+        momentum_feature_policy:
+          when: "live_only"      # live_only | always
+          norm: "zscore"
+          max_abs_z: 3.0
+          weight: 0.15
+          features: ["momentum_score","serve_win_prob_delta","point_streak"]
+        granularities: ["hourly","daily","weekly","monthly"]
+        update_cadence_min: { hourly: 15, daily: 1440, weekly: 10080, monthly: 43200 }
+        index_paths:
+          hourly:   "./data/faiss/tennis_matches_hourly"
+          daily:    "./data/faiss/tennis_matches_daily"
+          weekly:   "./data/faiss/tennis_matches_weekly"
+          monthly:  "./data/faiss/tennis_matches_monthly"
+    crypto:
+      symbols_universe: ["BTC/USDT","ETH/USDT","SOL/USDT","ADA/USDT","BNB/USDT","XRP/USDT"]
+      kraken:
+        margin_enabled: false       # set true to allow live shorting on supported pairs
+        ws_subscriptions:
+          ticker: ["XBT/USDT","ETH/USDT"]
+          book: []
+          trade: []
+      knn:
+        enabled: true
+        k_default: 5
+        metric: "cosine"
+        embed_model: "sentence-transformers/all-MiniLM-L6-v2"
+        features: ["close_price","volume","RSI14","ATR14","HV30","volume_zscore","daily_return"]
+        granularities: ["hourly","daily","weekly","monthly"]
+        update_cadence_min: { hourly: 15, daily: 1440, weekly: 10080, monthly: 43200 }
+        index_paths:
+          hourly:   "./data/faiss/crypto_symbols_hourly"
+          daily:    "./data/faiss/crypto_symbols_daily"
+          weekly:   "./data/faiss/crypto_symbols_weekly"
+          monthly:  "./data/faiss/crypto_symbols_monthly"
+    costs:
+      borrow_default_daily_bps: 10
+    auth:
+      dashboard_auth: ["local","google_oauth"]
+      tokens: "JWT"
+      two_factor_auth: true
+      keyring_fallback: "db_encrypted"
+      jwt: { access_token_ttl_min: 60, refresh_token_ttl_days: 7 }
+      password_policy:
+        min_length: 10
+        require_upper: true
+        require_lower: true
+        require_digit: true
+        require_symbol: true
+        history: { enforce: true, last_n: 3 }
+        rotation:
+          max_age_days: 180
+          reminder_days_before: 14
+          reminder_channel: "#security"
+      cli: { token_env_var: "RLCTL_TOKEN" }
+    notifications:
+      slack_default_webhook: ""
+      twilio:
+        enabled: true
+        from_number: "env:TWILIO_FROM"
+        inbound_webhook: "/notify/twilio/inbound"
+    operational:
+      paper_dry_run_timeout_sec: 600
+      dry_run_cost_delta_report: true
+  domain_globals_in_db:
+    tables: ["global_config_settings","crypto_global_settings","tennis_global_settings"]
+    precedence: >
+      On startup: load ENV first → then read DB and **override** runtime config
+      **per field** where DB has a value that differs. Do **not** write ENV into DB
+      during startup (seeding happens via CLI `rlctl settings import-env`).
+    secrets_encryption: "AES-GCM with master key from OS keyring; rotate-able"
+  bot_defaults:
+    domain: "crypto"
+    instruments: ["BTC/USDT","ETH/USDT"]
+    scaler: "${global.default_scaler}"
+    augmentation: "${global.augmentation}"
+    algorithms:
+      td3: true
+      ppo: true
+      dt:  true
+      stat_arb: true
+      crypto_vae: true
+      gnn_forecaster: true
+      lag_llama: true
+      llm_explainer_rag: true
+    router_policy: "${global.routing.policy}"
+    venues_enabled: "${global.routing.venues}"
+    kelly_fraction: "${global.kelly_fraction}"
+    kelly_cap_pct: "${global.kelly_cap_pct}"
+    horizon: "1m"
+    live_enabled: false
+    slack_webhook_url: "${global.notifications.slack_default_webhook}"
+  default_bots:
+    - { key: "dt_default_crypto",  algo: "dt",  paper: "2106.01345v2", domain: "crypto" }
+    - { key: "finrl_default_crypto", algo: "ppo", paper: "Hilpisch book baseline", domain: "crypto" }
+    - { key: "benter_default_tennis", algo: "benter_adjust", domain: "tennis" }
+  plugins:
+    registry:
+      - "stat_arb"
+      - "crypto_vae"
+      - "gnn_forecaster"
+      - "lag_llama"
+      - "prophet_combo"
+      - "pygod_anomaly"
+      - "llm_explainer_rag"
+      - "tennis_benter_logit"
+      - "multi_agent_coordinator"
+    conflict_policy: "error"
+    manifest_schema:
+      version: "1.0"
+      fields:
+        - key: string
+        - entrypoint: string
+        - provides: [ "algo", "feature", "router_hook" ]
+        - config_schema: object
+        - compat:
+            python: ">=3.11"
+            torch: "==2.4.*"
+            cuda: [ "11.8", "12.1" ]
+    examples:
+      - key: "llm_explainer_rag"
+        entrypoint: "backend_py.plugins.llm_explainer_rag:Plugin"
+        provides: ["feature"]
+        config_schema:
+          generator_model: "string"
+          quantization: "string"
+          embed_model: "string"
+          index_path: "string"
+      - key: "tennis_benter_logit"
+        entrypoint: "backend_py.plugins.tennis_benter_logit:Plugin"
+        provides: ["algo"]
+        config_schema:
+          link: "string  # logit|probit"
+          features: "array"
+      - key: "multi_agent_coordinator"
+        entrypoint: "backend_py.plugins.multi_agent_coordinator:Plugin"
+        provides: ["algo"]
+        config_schema:
+          levels: "object"
+          distribution_lib: "ray"
+
+.env_schema:
+  purpose: "Bootstrap only; import into DB settings via CLI; never required at runtime after import."
+  required:
+    - DB_URL
+    - SECRET_KEY
+    - JWT_SECRET
+    - MLFLOW_TRACKING_URI
+    - POLYGON_API_KEY
+    - BINANCEUS_KEY         # alias: BINANCE_US_API_KEY supported
+    - BINANCEUS_SECRET      # alias: BINANCE_US_API_SECRET supported
+    - COINBASE_API_KEY
+    - COINBASE_API_SECRET
+    - KRAKEN_API_KEY
+    - KRAKEN_API_SECRET
+    - ROBINHOOD_CRYPTO_API_KEY
+    - ROBINHOOD_CRYPTO_PRIVATE_KEY_B64
+    - ROBINHOOD_CRYPTO_PUBLIC_KEY_B64
+    - THEODDSAPI_KEY
+    - SLACK_WEBHOOK_URL
+    - SLACK_BOT_TOKEN
+    - SLACK_CRYPTO_CLIENT_ID
+    - SLACK_TENNIS_CLIENT_ID
+    - SLACK_CRYPTO_WEBHOOK    # alias: SLACK_CRYPTO_WEBHOOK
+    - SLACK_TENNIS_WEBHOOK    # alias: SLACK_TENNIS_WEBOOK
+    - TWILIO_SID
+    - TWILIO_TOKEN
+    - TWILIO_FROM
+    - SMTP_HOST
+    - SMTP_PORT
+    - SMTP_USER
+    - SMTP_PASS
+    - NEXT_PUBLIC_CRYPTO_API_URL
+    - NEXT_PUBLIC_TENNIS_API_URL
+  optional:
+    - API_CORS_ORIGINS
+    - OTEL_EXPORTER_OTLP_ENDPOINT
+    - REDIS_URL
+  aliases:
+    BINANCE_US_API_KEY: BINANCEUS_KEY
+    BINANCE_US_API_SECRET: BINANCEUS_SECRET
+    SLACK_TENNIS_WEBOOK: SLACK_TENNIS_WEBHOOK
+  notes: >
+    ROBINHOOD_CRYPTO_PRIVATE_KEY_B64 must be base64 of the 32‑byte Ed25519 private key (seed) — typically ~44 chars including padding "==".
+    ROBINHOOD_CRYPTO_PUBLIC_KEY_B64 is the Ed25519 public key (base64).
+    Keys stored via OS keyring at runtime; imported into DB settings; redact in logs.
+
+phases:
+  current: "mvp"
+  definitions:
+    mvp:
+      enable:
+        algorithms:
+          td3: true
+          dt: true
+          ppo: true
+          sac: true
+          stat_arb: true
+          crypto_vae: true
+          gnn_forecaster: true
+          lag_llama: true
+          llm_explainer_rag: true
+          benter_adjust: true
+        modules:
+          benter_adjust: true
+          pygod: true
+          gnn_forecaster: true
+          lag_llama: true
+          tennis_benter_logit: true
+          tennis_knn_faiss: true
+          crypto_knn_faiss: true
+          auth_signup_verify: true
+          theoddsapi_live_levels: true
+          twilio_sms: true
+          slack_private_chat: true
+  phase_apply_policy: "enforce"
+
+data_model:
+  entities:
+    - User:
+        fields:
+          id: uuid
+          email: text
+          password_hash: text
+          password_history: jsonb
+          password_last_changed_at: timestamptz|null
+          name: text
+          role: enum[STANDARD,PREMIUM,ADMIN,ROOT]
+          phone: text|null
+          twofa_enabled: bool
+          email_verified_at: timestamptz|null
+          oauth_provider: text|null
+          oauth_subject: text|null
+          created_at: timestamptz
+        indexes: ["email","role"]
+    - VerificationToken:
+        fields: { id: uuid, user_id: uuid, token: text, purpose: enum[EMAIL_VERIFY,RESET], expires_at: timestamptz, used_at: timestamptz|null }
+    - GlobalConfig:
+        fields: { id: uuid, key: str, value_json: jsonb, encrypted: bool, updated_at: timestamptz }
+    - CryptoGlobalSettings:
+        fields: { id: uuid, settings_json: jsonb, updated_at: timestamptz }
+    - TennisGlobalSettings:
+        fields: { id: uuid, settings_json: jsonb, updated_at: timestamptz }
+    - Dataset:
+        fields: { id: uuid, name: str, domain: enum[crypto,tennis], bar: enum[1m,5m,15m,1h,1d], start: timestamptz, end: timestamptz, path_parquet: str, features_schema: jsonb, created_at: timestamptz }
+        indexes: ["domain","bar","start"]
+    - FeatureCatalog:
+        fields: { id: uuid, dataset_id: uuid, indicators: jsonb, pacf_summary: jsonb, rfe_rankings: jsonb, vif_scores: jsonb, pca_summary: jsonb, lag_grid_spec: jsonb, scaler: str, created_at: timestamptz }
+    - Model:
+        fields: { id: uuid, algo: enum[td3,ppo,sac,dt,stat_arb,crypto_vae,gnn_forecaster,lag_llama,xgb,lstm,sarima,prophet,llm_explainer_rag,benter_adjust,tennis_benter_logit,multi_agent_coordinator], domain: enum[crypto,tennis], horizon: str, path_artifact: str, metrics: jsonb, preprocess: jsonb, created_at: timestamptz, version_tag: str }
+    - ModelFamily:
+        fields: { id: uuid, name: text, domain: text, created_at: timestamptz }
+    - ModelVersion:
+        fields: { id: uuid, family_id: uuid, model_id: uuid, version: text, created_at: timestamptz, notes: text }
+        indexes: ["family_id","version"]
+    - ModelArtifact:
+        fields: { id: uuid, model_id: uuid, kind: enum[SCALER,COLUMNS,WEIGHTS,OTHER], path: text, version: text, created_at: timestamptz, meta: jsonb }
+    - Bot:
+        fields:
+          id: uuid
+          name: str
+          domain: enum[crypto,tennis]
+          config_json: jsonb
+          status: enum[DRAFT,TRAINED,PAPER,LIVE,PAUSED]
+          created_at: timestamptz
+          updated_at: timestamptz
+          slack_webhook_url: text|null
+          slack_channel: text|null
+        indexes: ["domain","status"]
+    - BotRun:
+        fields: { id: uuid, bot_id: uuid, stage: enum[train,backtest,paper,live], start_ts: timestamptz, end_ts: timestamptz|null, status: enum[PENDING,RUNNING,SUCCEEDED,FAILED], logs_uri: str, metrics: jsonb, kpis: jsonb }
+    - Trade:
+        fields: { id: uuid, bot_id: uuid, venue: str, symbol: str, side: enum[LONG,SHORT,FLAT,BET], qty: numeric, entry_ts: timestamptz, exit_ts: timestamptz|null, entry_px: numeric, exit_px: numeric|null, pnl: numeric, fees_bps: numeric, spread_bps: numeric, slippage_bps: numeric, borrow_bps: numeric|null, paper_live: enum[PAPER,LIVE], meta: jsonb }
+        indexes: ["bot_id","symbol","entry_ts"]
+    - RouterDecision:
+        fields:
+          id: uuid
+          ts: timestamptz
+          symbol: str
+          side: str
+          expected_cost_bps: numeric
+          venue_rankings: jsonb
+          chosen_venue: str
+          realized_cost_bps: numeric|null
+          cost_delta_bps: numeric|null
+          failover_count_24h: integer|null
+          failover_reason: text|null
+          health: jsonb
+          meta: jsonb
+    - GraphSnapshot:
+        fields: { id: uuid, ts: timestamptz, graph_meta: jsonb, adj_hash: text, node_features_hash: text, nodes_schema: jsonb, edges_schema: jsonb }
+    - GnnForecast:
+        fields: { id: uuid, ts: timestamptz, horizon: str, symbols: text[], quantiles: jsonb, metrics: jsonb, meta: jsonb }
+    - Player:
+        fields: { id: uuid, name: text, hand: enum[L,R,Ambi]|null, backhand: enum[1H,2H]|null, country: text|null, dob: date|null, active: bool }
+        indexes: ["name","active"]
+    - PlayerElo:
+        fields: { id: uuid, player_id: uuid, surface: enum[hard,clay,grass,indoor]|null, elo: numeric, ts: timestamptz }
+        indexes: ["player_id","surface","ts"]
+    - PlayerStats:
+        fields: { id: uuid, player_id: uuid, surface: enum[hard,clay,grass,indoor]|null, window: enum[L5,L10,SEASON], stats_json: jsonb, ts: timestamptz }
+        indexes: ["player_id","surface","window","ts"]
+    - OddsCache:
+        fields: { id: uuid, event_id: uuid, level: enum[MATCH,SET,GAME], books: text[], odds_json: jsonb, ts: timestamptz }
+        indexes: ["event_id","level","ts"]
+    - TennisEvent:
+        fields: { id: uuid, tournament: str, round: str|null, player_a: str, player_b: str, surface: enum[hard,clay,grass,indoor]|null, start_ts: timestamptz, status: enum[SCHEDULED,LIVE,FINAL], source: str, odds_cache_key: text, odds_levels_json: jsonb|null }
+        indexes: ["start_ts","status"]
+    - TennisBet:
+        fields: { id: uuid, event_id: uuid, selection: str, market: enum[MONEYLINE,SET,GAME,OVER_UNDER,PARLAY], legs: jsonb, model_prob: numeric, market_fair_prob: numeric, benter_prob: numeric, price_offered: numeric, kelly_frac: numeric, stake: numeric, result: enum[PENDING,WON,LOST,VOID], payout: numeric|null, meta: jsonb }
+    - TennisMatchEmbedding:
+        fields: { id: uuid, event_id: uuid, player_a: text, player_b: text, surface: text|null, tournament: text|null, round: text|null, ts: timestamptz, granularity: enum[HOURLY,DAILY,MONTHLY,WEEKLY], vector: vector, meta: jsonb }
+        indexes: ["event_id","granularity","ts"]
+    - CryptoSymbolEmbedding:
+        fields: { id: uuid, symbol: text, date: date, granularity: enum[HOURLY,DAILY,MONTHLY,WEEKLY], vector: vector, meta: jsonb }
+        indexes: ["symbol","date","granularity"]
+    - ExplanationFile:
+        fields: { id: uuid, domain: enum[crypto,tennis], ref_id: uuid, path_txt: text, created_at: timestamptz, meta: jsonb }
+    - AnomalySignal:
+        fields: { id: uuid, ts: timestamptz, model: text, symbol: text, score: numeric, zscore: numeric, norm_method: enum[zscore,robust], level: enum[INFO,WARNING,CRITICAL], meta: jsonb }
+        indexes: ["symbol","model","ts"]
+    - Notification:
+        fields: { id: uuid, channel: enum[SLACK,EMAIL,SMS], user_id: uuid|null, ts: timestamptz, subject: str, body: str, status: enum[SENT,FAILED] }
+    - Wallet:
+        fields: { id: uuid, user_id: uuid, venue: text, asset: text, balance: numeric, updated_at: timestamptz }
+        indexes: ["user_id","venue","asset"]
+    - WithdrawalRequest:
+        fields: { id: uuid, user_id: uuid, venue: text, asset: text, amount: numeric, address: text, status: enum[PENDING,APPROVED,REJECTED,SENT], created_at: timestamptz, approved_at: timestamptz|null, tx_id: text|null, meta: jsonb }
+        indexes: ["user_id","venue","status"]
+
+security_rules:
+  auth:
+    dashboard: "Local + optional Google OAuth; JWT for sessions."
+    two_factor: true
+  secrets:
+    storage: "DB (encrypted) with bootstrap from .env; OS keyring master key; rotate keys; never log secrets."
+    keyring_fallback: "db_encrypted"
+  cors:
+    allow_origins: "env:API_CORS_ORIGINS|*"
+    allow_credentials: true
+    allow_methods: ["GET","POST","PATCH","DELETE","OPTIONS"]
+    allow_headers: ["*"]
+  rate_limits:
+    theoddsapi: { rpm: 3, backoff_ms: 500 }
+    exchanges: { rpm: 20, backoff_ms: 250 }
+    kraken_rest: { rpm: 30, backoff_ms: 250 }
+    signup: { rpm: 5, window_sec: 300 }
+    rest_default: { rpm: 600, window_sec: 60 }
+    webhooks:
+      twilio_inbound: { rpm: 30, window_sec: 60 }
+      slack_events:   { rpm: 120, window_sec: 60 }
+  webhooks:
+    validation:
+      twilio: "Validate X-Twilio-Signature with full URL + body"
+      slack:  "Verify signing secret (if used) or rely on Socket Mode token"
+  file_permissions:
+    artifacts: "0600 owner; no world-readable"
+  ip_controls:
+    live_endpoints_allowlist:
+      enabled: true
+      cidrs: []
+
+routing:
+  expected_cost:
+    components: ["maker_taker_fee_bps","effective_spread_bps","slippage_bps_model","borrow_bps_if_short","fill_probability"]
+    calculation_spec: "expected_cost_bps = fees_bps + effective_spread_bps + slippage_bps (+ borrow_bps_if_short)"
+    realized_cost_spec: "realized_cost_bps = fees_bps + realized_spread_bps + realized_slippage_bps (+ borrow_bps_if_short)"
+    delta_spec: "cost_delta_bps = realized_cost_bps - expected_cost_bps"
+    venue_stats_retention_days: 30
+    drift_threshold_pct: 20
+    rebalance_policy: "Update venue weights daily; if realized cost drift > 20% vs model over 500 fills, trigger failover & Slack alert."
+  stock_hours_guard:
+    rule: "Only compute coin↔stock pair features and trade signals during stock market hours; else cache/skip."
+  symbol_mapping:
+    robinhood:
+      BTC/USDT: BTC-USD
+      ETH/USDT: ETH-USD
+      SOL/USDT: SOL-USD
+      ADA/USDT: ADA-USD
+      BNB/USDT: BNB-USD
+      XRP/USDT: XRP-USD
+    kraken:
+      BTC/USDT: XBT/USDT
+      ETH/USDT: ETH/USDT
+      SOL/USDT: SOL/USDT
+      ADA/USDT: ADA/USDT
+      XRP/USDT: XRP/USDT
+
+observability:
+  metrics:
+    prometheus:
+      enabled: true
+      path: "/metrics"
+      counters:
+        - { name: jobs_total, labels: [stage,status], help: "Jobs submitted by stage" }
+        - { name: trades_total, labels: [bot_id,venue,side,paper_live], help: "Trades executed" }
+        - { name: router_decisions_total, labels: [symbol,venue], help: "Routing decisions made" }
+        - { name: notifications_total, labels: [channel,status], help: "Notifications sent" }
+        - { name: anomaly_alerts_total, labels: [model,symbol,level], help: "PyGOD alerts" }
+        - { name: signup_attempts_total, labels: [result], help: "Signup attempts" }
+        - { name: rag_queries_total, labels: [domain], help: "RAG queries" }
+        - { name: password_rotation_reminders_total, labels: [channel], help: "Password rotation reminder notifications sent" }
+        - { name: robinhood_sign_fail_total, labels: [reason], help: "Signature failures" }
+        - { name: twilio_inbound_total, labels: [status], help: "Twilio inbound messages" }
+        - { name: slack_dm_total, labels: [domain], help: "Slack DM requests to LLM" }
+        - { name: kraken_ws_messages_total, labels: [channel], help: "Kraken WS messages" }
+        - { name: kraken_ws_reconnects_total, labels: [], help: "Kraken WS reconnects" }
+      histograms:
+        - { name: order_latency_seconds, labels: [venue], buckets: [0.05,0.1,0.25,0.5,1,2,5], help: "Order latency distribution" }
+        - { name: cost_delta_bps, labels: [venue], buckets: [-50,-20,-10,-5,-2,0,2,5,10,20,50], help: "Modeled vs realized cost deltas (bps)" }
+        - { name: rag_query_latency_ms, labels: [domain], buckets: [10,25,50,100,250,500,1000], help: "RAG latency" }
+        - { name: knn_query_latency_ms, labels: [domain,granularity], buckets: [1,5,10,20,50,100,200,500,1000], help: "FAISS KNN latency" }
+        - { name: agent_step_latency_ms, labels: [level], buckets: [1,5,10,20,50,100,200,500], help: "Per-agent step latency (ms)" }
+        - { name: robinhood_clock_skew_seconds, labels: [], buckets: [0,1,2,5,10,20,30,60], help: "Client minus server skew at order time (if available)" }
+  tracing:
+    enabled: false
+    exporter: "otlp_http"
+    endpoint: "env:OTEL_EXPORTER_OTLP_ENDPOINT|http://localhost:4318/v1/traces"
+    sampling_ratio: 0.1
+    service_name: "rl-crypto-tennis"
+  logging:
+    structured: true
+    log_level: "info"
+    redact_fields: [api_key, api_secret, token, password, sid]
+  tracking:
+    mlflow:
+      uri: "env:MLFLOW_TRACKING_URI"
+      artifacts: "local path or S3/MinIO"
+  alerts:
+    slack:
+      nightly_digest: true
+      weekly_strategy_summary: true
+      dry_run_cost_report: true
+      anomaly_high_immediate: true
+      failover_immediate: true
+      password_rotation_reminders: true
+      cadence: { critical: "immediate", warning: "15m", info: "hourly" }
+  slo:
+    agent_step_latency_ms_p95: 50
+    password_max_age_days: 180
+
+fees_and_policies:
+  crypto:
+    default_fees_bps: { taker: 6, maker: 2 }
+    robinhood_effective_cost: "Use mid vs exec to measure spread cost per fill."
+    shorting:
+      allowed_live_default: false
+      allowed_paper: true
+      notes: "Live shorting is only available on venues that provide margin/derivatives. Binance.US spot does **not** support live shorting."
+      per_instrument_venue_overrides:
+        - { symbol: "BTC/USDT", venue: "kraken", allowed: true }
+  tennis:
+    commissions:
+      betfair_commission_pct: 2
+      sporttrade_commission_pct: 2
+      novig_commission_pct: 0
+      notes: "0% commission can still imply wider spreads; captured via price inputs."
+    benter_calibration:
+      blend_form: "logit(p*) = α + β1·logit(p_model) + β2·logit(p_mkt)"
+      staking: "fractional Kelly; cap via bot/global settings"
+      odds_band_publish: "Publish p* & stake across ±5pp around market line; post to Slack"
+      doc: "API /tennis/benter returns {p_star, stake, band_table±5pp}"
+
+apis:
+  docs:
+    openapi_route: "/openapi.json"
+    redoc_route: "/redoc"
+    swagger_route: "/docs"
+  rest:
+    - GET  /healthz
+    - GET  /version
+    - POST /bootstrap/env/import
+    - GET  /settings/global
+    - PATCH /settings/global
+    - GET  /settings/domain/{domain}
+    - PATCH /settings/domain/{domain}
+    - POST /bots
+    - GET  /bots
+    - GET  /bots/status
+    - GET  /bots/{id}
+    - PATCH /bots/{id}
+    - POST /bots/{id}/start
+    - POST /bots/{id}/stop
+    - POST /bots/{id}/pause
+    - POST /bots/{id}/resume
+    - GET  /bots/{id}/runs
+    - GET  /bots/{id}/kpis
+    - POST /datasets/ingest/crypto
+    - POST /features/compute
+    - POST /train
+    - POST /backtest
+    - POST /paper/start
+    - POST /paper/stop
+    - POST /paper/dryrun/start
+    - POST /paper/dryrun/stop
+    - GET  /paper/status
+    - POST /live/enable
+    - POST /live/disable
+    - POST /live/kill
+    - GET  /router/quote
+    - POST /router/route
+    - GET  /gnn/forecast
+    - POST /gnn/build_graph
+    - POST /anomaly/train
+    - POST /anomaly/predict
+    - GET  /tennis/events
+    - GET  /tennis/odds/{event_id}
+    - GET  /tennis/sportsbooks
+    - POST /tennis/sportsbooks/select
+    - POST /tennis/players/ingest
+    - POST /tennis/benter
+    - GET  /tennis/knn
+    - POST /tennis/parlay/copula
+    - GET  /crypto/knn
+    - POST /rag/index
+    - POST /llm/explain
+    - POST /auth/signup
+    - POST /auth/verify-email
+    - POST /auth/login
+    - POST /auth/refresh
+    - GET  /auth/password/expiry
+    - POST /auth/password/change
+    - POST /models/promote
+    - GET  /models/{id}/artifacts
+    - POST /notify/slack
+    - POST /notify/email
+    - POST /notify/twilio/inbound        # Twilio webhook (X-Twilio-Signature validated)
+    - POST /notify/slack/events          # Slack Events API endpoint
+    - POST /notify/slack/command         # Slash commands
+    - POST /notify/slack/subscribe       # Subscribe a channel/DM to live feeds
+    - POST /notify/slack/unsubscribe
+    - POST /wallets/withdraw/request     # create withdrawal request (requires approval)
+    - POST /wallets/withdraw/approve     # admin approval
+    - GET  /wallets/balances             # read-only snapshot (deposit is manual)
+    - GET  /openapi.json
+    - GET  /docs
+    - GET  /redoc
+    - GET  /metrics
+    - POST /rl/hierarchy/configure
+    # 🎯 Robinhood Crypto REST (backend → frontend)
+    - GET  /crypto/robinhood/accounts
+    - GET  /crypto/robinhood/trading_pairs
+    - GET  /crypto/robinhood/holdings
+    - GET  /crypto/robinhood/bbo
+    - GET  /crypto/robinhood/estimate
+    - POST /crypto/robinhood/orders
+    - POST /crypto/robinhood/orders/{order_id}/cancel
+    - GET  /crypto/robinhood/orders
+    - GET  /crypto/robinhood/orders/{order_id}
+    # 🐙 Kraken Spot (ccxt REST + public WS)
+    - GET  /crypto/kraken/ticker
+    - GET  /crypto/kraken/balances
+    - GET  /crypto/kraken/open_orders
+    - POST /crypto/kraken/orders
+    - POST /crypto/kraken/orders/{order_id}/cancel
+  schemas:
+    /llm/explain:
+      fields: [text, rationale, features, risk_flags, scores, meta]
+    /tennis/parlay/copula:
+      fields: [family, legs, rank_correlation, regularization_eps, price, meta]
+    /tennis/odds/{event_id}:
+      response: "odds_json structured as {book: {level: {side_a: price, side_b: price, ts}}}"
+    /auth/signup:
+      fields: [email, password, name]
+    /crypto/knn:
+      response: "{symbol, k, granularity, results:[{symbol, similarity, meta}], ts}"
+
+websockets:
+  - /ws/prices
+  - /ws/jobs
+  - /ws/paper
+  - /ws/router
+  - /ws/tennis
+  - /ws/crypto
+  - /ws/anomalies
+  - /ws/bots/{bot_id}
+  throttle:
+    per_client_max_msgs_per_sec: 10
+    burst_limit: 100
+  messages_examples:
+    - { type: "JOB_STATUS",  fields: [job_id, stage, status, progress_pct, ts] }
+    - { type: "PAPER_FILL",  fields: [bot_id, venue, symbol, side, qty, px, slippage_bps, ts] }
+    - { type: "ROUTER_DECISION", fields: [symbol, chosen_venue, expected_cost_bps, ranking, ts] }
+    - { type: "KPI_UPDATE",  fields: [bot_id, roi, sharpe, mdd, ts] }
+    - { type: "ODDS_UPDATE", fields: [event_id, level, bookmaker, odds_snapshot_ts, changed_fields, edge_delta] }
+    - { type: "KNN_RESULTS", fields: [domain, ref, k, granularity, results, ts] }
+    - { type: "ANOMALY_ALERT", fields: [symbol, score, zscore, detector, level, ts] }
+    - { type: "AGENT_UPDATE", fields: [level, agent_id, state, reward, ts] }
+
+runtime_modes:
+  env_var: APP_ENV
+  values: [test, dev, staging, prod]
+  switches:
+    test:
+      app_domain: "crypto"
+      db_url: "postgresql+psycopg://user:pass@localhost:5432/rl_test"
+      ws_enabled: true
+      odds_cache_ttl: 15
+      live_allowed: false
+    dev:
+      app_domain: "crypto"
+      db_url: "postgresql+psycopg://user:pass@localhost:5432/rl_dev"
+      ws_enabled: true
+      odds_cache_ttl: 30
+      live_allowed: false
+    staging:
+      app_domain: "from_env"
+      db_url: "postgresql+psycopg://user:pass@localhost:5432/rl_staging"
+      ws_enabled: true
+      odds_cache_ttl: 45
+      live_allowed: false
+    prod:
+      app_domain: "from_env|crypto"
+      db_url: "env:DB_URL"
+      ws_enabled: true
+      odds_cache_ttl: 60
+      live_allowed: true
+      overrides:
+        global:
+          rl_hierarchy: { enabled: true }
+          auth:
+            password_policy:
+              rotation:
+                max_age_days: 180
+                reminder_days_before: 14
+
+simulation:
+  engine:
+    endpoints:
+      - POST /simulate/start
+      - POST /simulate/stop
+      - GET  /simulate/status
+    scenarios:
+      - { name: "crypto_spread_shock", params: { symbol: "BTC/USDT", shock_bps: 10, duration_min: 30 } }
+      - { name: "thin_liquidity", params: { venue: "coinbase", fill_prob_scale: 0.5 } }
+      - { name: "tennis_underdog_rally", params: { odds_shift_pct: 15, cadence_sec: 60 } }
+      - { name: "pygod_anomaly_spike", params: { level: "CRITICAL", duration_min: 10 } }
+      - { name: "high_latency_venue", params: { venue: "kraken", latency_ms: 1000, duration_min: 10 } }
+      - { name: "live_odds_spike", params: { event_id: "sample", level: "match", shift_pct: 10, duration_min: 5 } }
+      - { name: "agent_failover", params: { level: "intermediate", duration_min: 10 } }
+    metrics_export: true
+    include_gnn_metrics: true
+
+cli:
+  tool: "rlctl"
+  commands:
+    - "rlctl login --email EMAIL --password *****"
+    - "rlctl settings import-env"
+    - "rlctl backend start --domain crypto|tennis|both"
+    - "rlctl bot new --name NAME --domain crypto --algo dt --instruments BTC/USDT --horizon 1m"
+    - "rlctl bot train --bot BOT_ID"
+    - "rlctl bot backtest --bot BOT_ID"
+    - "rlctl bot paper --bot BOT_ID start|stop"
+    - "rlctl bot live  --bot BOT_ID enable|disable"
+    - "rlctl bot pause --bot BOT_ID"
+    - "rlctl bot resume --bot BOT_ID"
+    - "rlctl bots list"
+    - "rlctl bots stop --all"
+    - "rlctl bot attach-model --bot BOT_ID --model MODEL_ID"
+    - "rlctl model list --algo dt"
+    - "rlctl models promote --model-version MODEL_VERSION_ID"
+    - "rlctl model artifacts --model MODEL_ID"
+    - "rlctl data ingest --source polygon --domain crypto --since 2022-01-01"
+    - "rlctl tennis odds fetch --event EVENT_ID --level match|set|game --books fanduel,draftkings"
+    - "rlctl tennis sportsbooks list"
+    - "rlctl tennis sportsbooks select --books fanduel,draftkings"
+    - "rlctl tennis players ingest --file path/to/player_elo.csv"
+    - "rlctl tennis knn --player 'Novak Djokovic' --k 5 --granularity daily"
+    - "rlctl crypto knn --symbol BTC/USDT --k 5 --granularity hourly"
+    - "rlctl explain trade --bot BOT_ID --tx TX_ID"
+    - "rlctl llm index --path ./docs --embed-model sentence-transformers/all-MiniLM-L6-v2"
+    - "rlctl admin advise --bot BOT_ID"
+    - "rlctl settings set-normalization --feature-scaler robust --anomaly-norm zscore"
+    - "rlctl docs openapi --out openapi.json"
+    - "rlctl docs cli"
+    - "rlctl rl hierarchy --bot BOT_ID --configure levels=base,intermediate,master"
+    - "rlctl settings hierarchy --enable"
+    - "rlctl settings hierarchy --disable"
+    - "rlctl security password-rotation remind-now"
+
+codegen:
+  python:
+    structure:
+      - backend_py/app.py
+      - backend_py/api/routes.py
+      - backend_py/api/routes_health.py
+      - backend_py/api/schemas.py
+      - backend_py/api/middleware_auth.py
+      - backend_py/api/routes_auth.py
+      - backend_py/api/routes_robinhood.py
+      - backend_py/api/routes_twilio.py              # 🆕
+      - backend_py/api/routes_slack.py               # 🆕
+      - backend_py/api/routes_kraken.py              # 🆕 Kraken REST routes
+      - backend_py/core/jobs.py
+      - backend_py/core/auth_policy.py
+      - backend_py/core/router.py
+      - backend_py/core/costs.py
+      - backend_py/core/kelly.py
+      - backend_py/core/augment.py
+      - backend_py/core/backtest.py
+      - backend_py/core/paper.py
+      - backend_py/core/live.py
+      - backend_py/core/tennis_benter.py
+      - backend_py/core/odds_cache.py
+      - backend_py/core/metrics.py
+      - backend_py/core/feature_pipeline.py
+      - backend_py/core/gnn.py
+      - backend_py/core/anomaly.py
+      - backend_py/core/explain.py
+      - backend_py/core/rag_index.py
+      - backend_py/crypto/crypto_knn.py
+      - backend_py/tennis/tennis_knn.py
+      - backend_py/llm/tennis_scripts.py
+      - backend_py/llm/chat_gateway.py               # 🆕 (Twilio/Slack → Llama-13 router)
+      - backend_py/rl/algos/td3.py
+      - backend_py/rl/algos/ppo.py
+      - backend_py/rl/algos/sac.py
+      - backend_py/rl/algos/decision_transformer.py
+      - backend_py/rl/algos/stat_arb.py
+      - backend_py/rl/algos/crypto_vae.py
+      - backend_py/rl/algos/gnn_forecaster.py
+      - backend_py/rl/algos/lag_llama.py
+      - backend_py/rl/algos/baselines/prophet_combo.py
+      - backend_py/rl/algos/multi_agent_coordinator.py
+      - backend_py/rl/envs/crypto_env.py
+      - backend_py/rl/envs/stat_arb_env.py
+      - backend_py/rl/envs/tennis_env.py
+      - backend_py/rl/utils/replay_buffers.py
+      - backend_py/anomaly/pygod_service.py
+      - backend_py/notif/slack.py
+      - backend_py/notif/email.py
+      - backend_py/notif/twilio_sms.py               # 🆕
+      - backend_py/utils/env_detect.py
+      - backend_py/utils/settings_loader.py          # 🆕 (ENV→DB precedence)
+      - backend_py/utils/feature_scripts/run_coin_comprehensive_analysis.py
+      - backend_py/utils/feature_scripts/run_pairwise_analysis.py
+      - backend_py/adapters/binanceus.py
+      - backend_py/adapters/coinbase.py
+      - backend_py/adapters/kraken.py                # 🆕 ccxt adapter
+      - backend_py/adapters/robinhood_crypto.py
+      - backend_py/adapters/polygon_crypto_fetcher.py
+      - backend_py/adapters/polygon_stock_fetcher.py
+      - backend_py/adapters/theodds_api.py
+      - backend_py/ws/kraken_ws.py                   # 🆕 public WS client
+      - backend_py/db/models.py
+      - backend_py/db/migrations/
+      - scripts/bootstrap_hardware.py
+      - scripts/deploy_db.py
+      - scripts/generate_openapi.py
+      - scripts/sql/001_core.sql
+      - scripts/sql/002_indexes.sql
+      - scripts/sql/003_odds.sql
+      - scripts/sql/004_graphs.sql
+      - scripts/sql/005_settings.sql
+      - scripts/sql/006_ops.sql
+      - scripts/password_rotation_reminder.py
+      - backend_py/plugins/loader.py
+      - backend_py/plugins/manifest_schema.json
+      - backend_py/tests/test_robinhood_adapter.py
+      - backend_py/tests/test_granularity_enums.py
+      - backend_py/tests/test_kraken_adapter.py      # 🆕
+
+  web:
+    structure:
+      - dashboard_web/next.config.js
+      - dashboard_web/src/app/layout.tsx
+      - dashboard_web/src/app/page.tsx
+      - dashboard_web/src/app/crypto/page.tsx
+      - dashboard_web/src/app/crypto/robinhood/page.tsx
+      - dashboard_web/src/app/bots/page.tsx
+      - dashboard_web/src/app/bots/[id]/page.tsx
+      - dashboard_web/src/app/jobs/page.tsx
+      - dashboard_web/src/app/data/page.tsx
+      - dashboard_web/src/app/models/page.tsx
+      - dashboard_web/src/app/paper/page.tsx
+      - dashboard_web/src/app/router/page.tsx
+      - dashboard_web/src/app/tennis/page.tsx
+      - dashboard_web/src/app/tennis/live.tsx
+      - dashboard_web/src/app/settings/page.tsx
+      - dashboard_web/src/app/settings/robinhood/page.tsx
+      - dashboard_web/src/app/explain/page.tsx
+      - dashboard_web/src/components/Charts/*.tsx
+      - dashboard_web/src/components/LaunchModal.tsx
+      - dashboard_web/src/components/BetSlip.tsx
+      - dashboard_web/src/components/AnomalyStrip.tsx
+      - dashboard_web/src/components/TennisMatchCard.tsx
+      - dashboard_web/src/components/LiveOddsPanel.tsx
+      - dashboard_web/src/components/OddsTicker.tsx
+      - dashboard_web/src/components/EdgeBar.tsx
+      - dashboard_web/src/components/SurfaceIcon.tsx
+      - dashboard_web/src/components/PlayerForm.tsx
+      - dashboard_web/src/components/SimilarMatches.tsx
+      - dashboard_web/src/components/SimilarSymbols.tsx
+      - dashboard_web/src/components/SportsbookSelector.tsx
+      - dashboard_web/src/components/NormalizationCard.tsx
+      - dashboard_web/src/components/ParamTooltip.tsx
+      - dashboard_web/src/components/HierarchyVisualizer.tsx
+      - dashboard_web/src/components/Robinhood/KeysStatus.tsx
+      - dashboard_web/src/components/Robinhood/OrderTicket.tsx
+      - dashboard_web/src/components/Robinhood/AccountSummary.tsx
+      - dashboard_web/src/components/Robinhood/HoldingsTable.tsx
+      - dashboard_web/src/components/Robinhood/QuotePanel.tsx
+      - dashboard_web/src/components/Robinhood/OrdersTable.tsx
+      - dashboard_web/src/store/useGlobal.ts
+      - dashboard_web/src/store/useTennis.ts
+      - dashboard_web/src/store/useBot.ts
+      - dashboard_web/src/lib/api.ts
+      - dashboard_web/src/lib/venues/robinhood.ts
+      - dashboard_web/tailwind.config.js
+      - dashboard_web/styles/globals.css
+
+docs:
+  structure:
+    - docs/api_schemas.md
+    - docs/db_schemas.md
+    - docs/plugins.md
+    - docker-compose.yml
+  content_notes:
+    - "Odds JSON schema documented with match/set/game examples & bookmaker keys."
+    - "KNN multi-granularity indices with Hugging Face adapter noted."
+    - "Multi-agent RL hierarchy documented with levels and efficiency notes."
+    - "Robinhood Crypto: Ed25519 signing, headers, endpoints, symbol mapping & router expectations."
+    - "Twilio/Slack: webhook/event shapes, privacy model (DMs) and rate limits."
+    - "Kraken Spot: WS subscribe examples (v2) and BTC→XBT symbol mapping."
+
+readme:
+  sections:
+    - title: "Environment & Keys (bootstrap → DB)"
+      content: |
+        Create `.env` (sample):
+        DB_URL=postgresql+psycopg://user:pass@localhost:5432/rl_dev
+        SECRET_KEY=change_me
+        JWT_SECRET=change_me
+        MLFLOW_TRACKING_URI=http://localhost:5000
+        POLYGON_API_KEY=pk_...
+        BINANCEUS_KEY=...
+        BINANCEUS_SECRET=...
+        COINBASE_API_KEY=...
+        COINBASE_API_SECRET=...
+        KRAKEN_API_KEY=...
+        KRAKEN_API_SECRET=...
+        ROBINHOOD_CRYPTO_API_KEY=rh-api-********************************
+        ROBINHOOD_CRYPTO_PRIVATE_KEY_B64=BASE64_ED25519_SEED_32B
+        ROBINHOOD_CRYPTO_PUBLIC_KEY_B64=BASE64_ED25519_PUBLIC
+        THEODDSAPI_KEY=...
+        SLACK_WEBHOOK_URL=https://hooks.slack.com/services/...
+        SLACK_BOT_TOKEN=xoxb-...
+        SLACK_CRYPTO_CLIENT_ID=...
+        SLACK_TENNIS_CLIENT_ID=...
+        SLACK_CRYPTO_WEBHOOK=https://hooks.slack.com/services/...
+        SLACK_TENNIS_WEBHOOK=https://hooks.slack.com/services/...
+        TWILIO_SID=AC...
+        TWILIO_TOKEN=...
+        TWILIO_FROM=+1XXXXXXXXXX
+        SMTP_HOST=smtp.example.com
+        SMTP_PORT=587
+        SMTP_USER=user
+        SMTP_PASS=pass
+        NEXT_PUBLIC_CRYPTO_API_URL=http://localhost:8000/api/crypto
+        NEXT_PUBLIC_TENNIS_API_URL=http://localhost:9000/api/tennis
+
+        Then import once:
+          rlctl settings import-env
+    - title: "ENV→DB precedence (runtime)"
+      content: |
+        Startup loader:
+        1) Load ENV file/vars.
+        2) Read DB global/domain settings.
+        3) For each key present in DB and differing from ENV, override runtime config with DB.
+        4) Do not mutate DB on startup; use `rlctl settings import-env` to seed/update DB.
+    - title: "Robinhood Crypto Integration"
+      content: |
+        **Auth & Signing**
+        - Ed25519; headers: x-api-key, x-signature, x-timestamp (seconds). Accept/Content-Type sent but not signed.
+        - String to sign: api_key + timestamp + path(+canonical sorted query) + method + body (stable JSON).
+        - Base URL: https://trading.robinhood.com
+        **Endpoints (proxied by backend)** same as `apis.rest` Robinhood block.
+    - title: "Kraken Spot Integration"
+      content: |
+        WebSocket (public): wss://ws.kraken.com/v2 — subscribe to ticker/book/trade; symbol note: BTC is XBT on Kraken.
+        REST (trading): via ccxt.kraken — create/cancel orders, open orders, balances.
+        Shorting/margin: use `leverage` param on `create_order`; hard-guarded by `config.crypto.kraken.margin_enabled` (default: false).
+        Example internal symbol mapping: "BTC/USDT" → Kraken "XBT/USDT".
+    - title: "Twilio SMS"
+      content: |
+        - Point your Twilio number's Messaging webhook to POST /notify/twilio/inbound.
+        - We verify the Twilio signature and route text to Llama‑13 via chat_gateway.
+        - Replies are sent from TWILIO_FROM to the sender. Rate-limited.
+    - title: "Slack Private Chat"
+      content: |
+        - Install the Slack app (uses SLACK_BOT_TOKEN). Users DM the bot for private Llama‑13 chats.
+        - Slash commands: /edge, /subscribe, /unsubscribe. Channel posts are optional; DMs are preferred for privacy.
+    - title: "Short selling & actions"
+      content: |
+        - Paper: allowed. Live: only on venues supporting margin/derivatives (e.g., Kraken). Binance.US spot: no live shorting.
+        - Action sets: discrete_basic, discrete_with_short, continuous_target.
+        - Choose per-bot via config or env.
+    - title: "Wallets: deposits & withdrawals"
+      content: |
+        - Deposits: manual (if balance=0 → prompt user to deposit).
+        - Withdrawals: POST /wallets/withdraw/request → admin approval required → /approve.
+
+workflows:
+  - name: py-metrics
+    agent: writer
+    steps:
+      - edit:
+          file: backend_py/core/metrics.py
+          create_if_missing: true
+          content: |
+            from prometheus_client import CONTENT_TYPE_LATEST, CollectorRegistry, generate_latest, multiprocess
+            from fastapi import FastAPI, Response
+            _registry = None
+            def setup_metrics(app: FastAPI, path: str = "/metrics") -> None:
+              global _registry
+              _registry = CollectorRegistry()
+              try:
+                multiprocess.MultiProcessCollector(_registry)
+              except Exception:
+                pass
+              @app.get(path)
+              def _metrics() -> Response:
+                return Response(content=generate_latest(_registry), media_type=CONTENT_TYPE_LATEST)
+  - name: py-bootstrap-hw
+    agent: writer
+    steps:
+      - edit:
+          file: scripts/bootstrap_hardware.py
+          create_if_missing: true
+          content: |
+            import json, platform, subprocess
+            def nv_query():
+              try:
+                out = subprocess.check_output(["nvidia-smi","--query-gpu=name,memory.total","--format=csv,noheader"], text=True)
+                gpus = [dict(name=l.split(",")[0].strip(), mem_mb=int(l.split(",")[1].strip().split()[0])*1024) for l in out.strip().splitlines()]
+              except Exception:
+                gpus = []
+              return gpus
+            info = {"os": platform.system(),"release": platform.release(),"is_wsl": "microsoft" in platform.version().lower(),"gpus": nv_query()}
+            print(json.dumps(info))
+  - name: py-sim-endpoints
+    agent: writer
+    steps:
+      - edit:
+          file: backend_py/api/routes.py
+          create_if_missing: true
+          content: |
+            from fastapi import APIRouter, Body
+            sim = APIRouter(prefix="/simulate", tags=["simulate"])
+            _state = {"running": False, "scenario": None}
+            @sim.post("/start")
+            def start(payload: dict = Body(default={"scenario":"default"})):
+              _state["running"] = True; _state["scenario"] = payload.get("scenario","default")
+              return {"ok": True, "state": _state}
+            @sim.post("/stop")
+            def stop():
+              _state["running"] = False
+              return {"ok": True, "state": _state}
+            @sim.get("/status")
+            def status():
+              return {"ok": True, "state": _state}
+  - name: db-deploy
+    agent: writer
+    steps:
+      - edit:
+          file: scripts/deploy_db.py
+          create_if_missing: true
+          content: |
+            import sys, subprocess
+            files = ["scripts/sql/001_core.sql","scripts/sql/002_indexes.sql","scripts/sql/003_odds.sql","scripts/sql/004_graphs.sql","scripts/sql/005_settings.sql","scripts/sql/006_ops.sql"]
+            dsn = None
+            for i,a in enumerate(sys.argv):
+              if a == "--dsn" and i+1 < len(sys.argv): dsn = sys.argv[i+1]
+            if not dsn: print("Missing --dsn"); sys.exit(2)
+            for f in files:
+              subprocess.check_call(["psql", dsn, "-v", "ON_ERROR_STOP=1", "-f", f])
+            print("DB deploy OK.")
+  - name: qa-python
+    agent: reviewer
+    steps:
+      - run: pytest -q backend_py/tests
+      - gate: { require_exit_code: 0, message_on_fail: "Python tests failed." }
+
+templates:
+  # -------------------------------
+  # 🆕 Health & Version routes
+  # -------------------------------
+  - path: backend_py/api/routes_health.py
+    language: python
+    description: "Health & version endpoints"
+    content: |
+      from fastapi import APIRouter
+      import os
+      import time
+      try:
+          import importlib.metadata as ilm  # py3.11
+      except Exception:
+          ilm = None
+      hz = APIRouter(tags=["ops"])
+      _started = int(time.time())
+      @hz.get("/healthz")
+      async def healthz():
+          return {"ok": True, "uptime_sec": int(time.time() - _started)}
+      @hz.get("/version")
+      async def version():
+          ver = os.getenv("APP_VERSION") or (ilm.version("fastapi") if ilm else "unknown")
+          return {"name": "rl-crypto-tennis", "version": ver}
+
+  # -------------------------------
+  # 🆕 FastAPI app wiring (CORS, routers, metrics, optional rate-limiter & tracing hook)
+  # -------------------------------
+  - path: backend_py/app.py
+    language: python
+    description: "App factory that mounts routers, metrics, CORS; optional tracing & rate limiting"
+    content: |
+      import os
+      from fastapi import FastAPI
+      from fastapi.middleware.cors import CORSMiddleware
+      try:
+          from fastapi_limiter import FastAPILimiter
+          import redis.asyncio as redis
+      except Exception:
+          FastAPILimiter = None
+          redis = None
+      # Routers
+      from backend_py.api.routes_health import hz
+      from backend_py.api.routes_robinhood import rh
+      from backend_py.api.routes_kraken import kr
+      from backend_py.api.routes_twilio import tw
+      from backend_py.api.routes_slack import sl
+      from backend_py.api.routes import sim
+      # Metrics
+      from backend_py.core.metrics import setup_metrics
+      # Optional tracing
+      def _maybe_init_tracing(app: FastAPI):
+          if os.getenv("OTEL_ENABLE", "false").lower() not in ("1","true","yes"):
+              return
+          try:
+              from opentelemetry import trace
+              from opentelemetry.sdk.trace import TracerProvider
+              from opentelemetry.sdk.trace.export import BatchSpanProcessor
+              from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+              provider = TracerProvider()
+              ep = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4318/v1/traces")
+              provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter(endpoint=ep)))
+              trace.set_tracer_provider(provider)
+          except Exception:
+              pass
+      async def _maybe_init_rate_limit():
+          if FastAPILimiter and redis:
+              try:
+                  r = await redis.from_url(os.getenv("REDIS_URL","redis://localhost:6379/0"), encoding="utf-8", decode_responses=True)
+                  await FastAPILimiter.init(r)
+              except Exception:
+                  pass
+      def create_app() -> FastAPI:
+          app = FastAPI(title="rl-crypto-tennis", version=os.getenv("APP_VERSION","0.0.0"))
+          # CORS
+          origins = [o.strip() for o in os.getenv("API_CORS_ORIGINS","*").split(",")]
+          app.add_middleware(
+              CORSMiddleware,
+              allow_origins=origins,
+              allow_credentials=True,
+              allow_methods=["*"],
+              allow_headers=["*"],
+          )
+          # Routers
+          app.include_router(hz)
+          app.include_router(sim)
+          app.include_router(rh)
+          app.include_router(kr)
+          app.include_router(tw)
+          app.include_router(sl)
+          # Metrics
+          setup_metrics(app, "/metrics")
+          # Tracing
+          _maybe_init_tracing(app)
+          # Rate limits (best-effort)
+          try:
+              import anyio
+              anyio.from_thread.run(_maybe_init_rate_limit)
+          except Exception:
+              pass
+          return app
+      app = create_app()
+
+  # -------------------------------
+  # ✅ Robinhood Crypto Adapter (already present)
+  # -------------------------------
+  - path: backend_py/adapters/robinhood_crypto.py
+    language: python
+    description: "Robinhood Crypto Trading adapter with Ed25519 signing and full endpoint coverage"
+    content: |
+      import base64, time, json
+      from dataclasses import dataclass
+      from typing import Any, Dict, List, Optional, Tuple
+      import httpx
+      from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+      DEFAULT_BASE = "https://trading.robinhood.com"
+
+      def _json_stable(obj: Any) -> str:
+          return json.dumps(obj, separators=(",", ":"), sort_keys=True) if obj is not None else ""
+
+      def _canonical_query(q: Dict[str, Any] | None) -> str:
+          if not q: return ""
+          items: List[Tuple[str, str]] = []
+          for k in sorted(q.keys()):
+              v = q[k]
+              if v is None: continue
+              if isinstance(v, (list, tuple)):
+                  for vi in v:
+                      items.append((k, str(vi)))
+              else:
+                  items.append((k, str(v)))
+          from urllib.parse import urlencode
+          return "?" + urlencode(items)
+
+      @dataclass
+      class RHConfig:
+          api_key: str
+          private_key_b64: str
+          base_url: str = DEFAULT_BASE
+          timeout_sec: float = 10.0
+
+      class RobinhoodCryptoAdapter:
+          """
+          Robinhood Crypto Trading API
+          - Ed25519 signatures
+          - Headers: x-api-key, x-signature (base64), x-timestamp (seconds)
+          - String to sign: api_key + timestamp + path(+query) + method + body
+          """
+          def __init__(self, cfg: RHConfig):
+              self.cfg = cfg
+              raw = base64.b64decode(cfg.private_key_b64)
+              if len(raw) != 32:
+                  raise ValueError("Ed25519 private key must be 32 bytes (seed) before base64")
+              self._sk = Ed25519PrivateKey.from_private_bytes(raw)
+              self._client = httpx.AsyncClient(base_url=cfg.base_url, timeout=cfg.timeout_sec)
+
+          async def aclose(self):
+              await self._client.aclose()
+
+          def _sign(self, method: str, path: str, body_str: str) -> Dict[str, str]:
+              ts = str(int(time.time()))
+              msg = (self.cfg.api_key + ts + path + method.upper() + (body_str or "")).encode("utf-8")
+              sig = self._sk.sign(msg)
+              sig_b64 = base64.b64encode(sig).decode()
+              return {
+                  "x-api-key": self.cfg.api_key,
+                  "x-signature": sig_b64,
+                  "x-timestamp": ts,
+                  "accept": "application/json",
+                  "content-type": "application/json",
+              }
+
+          async def _request(self, method: str, path: str, params: Dict[str, Any] | None = None, json_body: Any | None = None) -> Any:
+              q = _canonical_query(params)
+              body_str = _json_stable(json_body) if method.upper() in ("POST","PUT","PATCH") else ""
+              headers = self._sign(method, path + q, body_str)
+              if method.upper() == "GET":
+                  r = await self._client.get(path, params=params, headers=headers)
+              elif method.upper() == "POST":
+                  r = await self._client.post(path, content=body_str.encode("utf-8"), headers=headers)
+              else:
+                  raise ValueError(f"Unsupported method {method}")
+              r.raise_for_status()
+              ctype = r.headers.get("content-type","")
+              if r.content and "application/json" in ctype:
+                  return r.json()
+              return {"status_code": r.status_code, "content": r.text}
+
+          async def get_accounts(self) -> Any:
+              return await self._request("GET", "/api/v1/crypto/trading/accounts/")
+
+          async def get_trading_pairs(self, symbols: Optional[List[str]] = None) -> Any:
+              params = None
+              if symbols:
+                  params = {"symbol": symbols}
+              return await self._request("GET", "/api/v1/crypto/trading/trading_pairs/", params=params)
+
+          async def get_holdings(self, asset_codes: Optional[List[str]] = None) -> Any:
+              params = None
+              if asset_codes:
+                  params = {"asset_code": asset_codes}
+              return await self._request("GET", "/api/v1/crypto/trading/holdings/", params=params)
+
+          async def get_best_bid_ask(self, symbols: List[str]) -> Any:
+              params = {"symbol": symbols}
+              return await self._request("GET", "/api/v1/crypto/marketdata/best_bid_ask/", params=params)
+
+          async def get_estimated_price(self, symbol: str, side: str, quantities: List[str]) -> Any:
+              params = {"symbol": symbol, "side": side, "quantity": quantities}
+              return await self._request("GET", "/api/v1/crypto/marketdata/estimated_price/", params=params)
+
+          async def create_order(self, *, client_order_id: str, side: str, type: str, symbol: str,
+                                 asset_quantity: Optional[str] = None, price: Optional[str] = None) -> Any:
+              payload: Dict[str, Any] = {
+                  "client_order_id": client_order_id,
+                  "side": side,
+                  "type": type,
+                  "symbol": symbol
+              }
+              if type == "market":
+                  payload["market_order_config"] = {"asset_quantity": asset_quantity}
+              elif type == "limit":
+                  payload["limit_order_config"] = {"asset_quantity": asset_quantity, "price": price}
+              else:
+                  raise ValueError("type must be 'market' or 'limit'")
+              return await self._request("POST", "/api/v1/crypto/trading/orders/", json_body=payload)
+
+          async def cancel_order(self, order_id: str) -> Any:
+              return await self._request("POST", f"/api/v1/crypto/trading/orders/{order_id}/cancel/")
+
+          async def get_order(self, order_id: str) -> Any:
+              return await self._request("GET", f"/api/v1/crypto/trading/orders/{order_id}/")
+
+          async def list_orders(self, **params) -> Any:
+              return await self._request("GET", "/api/v1/crypto/trading/orders/", params=params or None)
+
+          @staticmethod
+          def to_rh_symbol(internal: str) -> str:
+              return internal.replace("/USDT", "-USD").replace("/", "-")
+
+          @staticmethod
+          def from_rh_symbol(rh: str) -> str:
+              return rh.replace("-USD", "/USDT").replace("-", "/")
+
+  - path: backend_py/api/routes_robinhood.py
+    language: python
+    description: "FastAPI router exposing Robinhood Crypto endpoints to the dashboard"
+    content: |
+      from fastapi import APIRouter, Depends, Query, Body, HTTPException
+      from pydantic import BaseModel, Field
+      import os, uuid
+      from .middleware_auth import require_user
+      from backend_py.adapters.robinhood_crypto import RobinhoodCryptoAdapter, RHConfig
+
+      rh = APIRouter(prefix="/api/crypto/robinhood", tags=["robinhood"])
+
+      _adapter: RobinhoodCryptoAdapter | None = None
+
+      async def get_adapter() -> RobinhoodCryptoAdapter:
+          global _adapter
+          if _adapter is None:
+              api_key = os.getenv("ROBINHOOD_CRYPTO_API_KEY","").strip()
+              pk_b64 = os.getenv("ROBINHOOD_CRYPTO_PRIVATE_KEY_B64","").strip()
+              base_url = os.getenv("ROBINHOOD_CRYPTO_BASE_URL","https://trading.robinhood.com").strip()
+              if not api_key or not pk_b64:
+                  raise HTTPException(status_code=500, detail="Robinhood credentials missing")
+              _adapter = RobinhoodCryptoAdapter(RHConfig(api_key=api_key, private_key_b64=pk_b64, base_url=base_url))
+          return _adapter
+
+      class CreateOrder(BaseModel):
+          client_order_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+          side: str
+          type: str
+          symbol: str
+          asset_quantity: str | None = None
+          price: str | None = None
+
+      @rh.get("/accounts")
+      async def accounts(user=Depends(require_user), adp: RobinhoodCryptoAdapter = Depends(get_adapter)):
+          return await adp.get_accounts()
+
+      @rh.get("/trading_pairs")
+      async def trading_pairs(symbol: list[str] = Query(default=None), user=Depends(require_user), adp: RobinhoodCryptoAdapter = Depends(get_adapter)):
+          return await adp.get_trading_pairs(symbols=symbol)
+
+      @rh.get("/holdings")
+      async def holdings(asset_code: list[str] = Query(default=None), user=Depends(require_user), adp: RobinhoodCryptoAdapter = Depends(get_adapter)):
+          return await adp.get_holdings(asset_codes=asset_code)
+
+      @rh.get("/bbo")
+      async def best_bid_ask(symbol: list[str] = Query(...), user=Depends(require_user), adp: RobinhoodCryptoAdapter = Depends(get_adapter)):
+          return await adp.get_best_bid_ask(symbols=symbol)
+
+      @rh.get("/estimate")
+      async def estimate(symbol: str, side: str, quantity: list[str] = Query(...), user=Depends(require_user), adp: RobinhoodCryptoAdapter = Depends(get_adapter)):
+          return await adp.get_estimated_price(symbol=symbol, side=side, quantities=quantity)
+
+      @rh.post("/orders")
+      async def create_order(payload: CreateOrder, user=Depends(require_user), adp: RobinhoodCryptoAdapter = Depends(get_adapter)):
+          return await adp.create_order(client_order_id=payload.client_order_id, side=payload.side, type=payload.type,
+                                        symbol=payload.symbol, asset_quantity=payload.asset_quantity, price=payload.price)
+
+      @rh.post("/orders/{order_id}/cancel")
+      async def cancel_order(order_id: str, user=Depends(require_user), adp: RobinhoodCryptoAdapter = Depends(get_adapter)):
+          return await adp.cancel_order(order_id)
+
+      @rh.get("/orders")
+      async def list_orders(user=Depends(require_user), adp: RobinhoodCryptoAdapter = Depends(get_adapter)):
+          return await adp.list_orders()
+
+      @rh.get("/orders/{order_id}")
+      async def get_order(order_id: str, user=Depends(require_user), adp: RobinhoodCryptoAdapter = Depends(get_adapter)):
+          return await adp.get_order(order_id)
+
+  # -------------------------------
+  # 🐙 Kraken: ccxt REST adapter
+  # -------------------------------
+  - path: backend_py/adapters/kraken.py
+    language: python
+    description: "Kraken Spot adapter using ccxt for REST trading; symbol mapping BTC→XBT; margin optional"
+    content: |
+      import os
+      from typing import Any, Dict, Optional
+      import anyio
+      import ccxt
+
+      def _client() -> ccxt.kraken:
+          key = os.getenv("KRAKEN_API_KEY", "")
+          secret = os.getenv("KRAKEN_API_SECRET", "")
+          return ccxt.kraken({"apiKey": key, "secret": secret, "enableRateLimit": True})
+
+      async def _call_sync(fn, *args, **kwargs):
+          return await anyio.to_thread.run_sync(lambda: fn(*args, **kwargs))
+
+      def to_kraken_symbol(sym: str) -> str:
+          # Internal like "BTC/USDT" → Kraken "XBT/USDT"
+          if sym and sym.startswith("BTC/"):
+              return "XBT/" + sym.split("/", 1)[1]
+          return sym
+
+      async def fetch_balance() -> Dict[str, Any]:
+          return await _call_sync(_client().fetch_balance)
+
+      async def fetch_ticker(symbol: str) -> Dict[str, Any]:
+          return await _call_sync(_client().fetch_ticker, to_kraken_symbol(symbol))
+
+      async def fetch_open_orders(symbol: Optional[str] = None) -> Any:
+          s = to_kraken_symbol(symbol) if symbol else None
+          return await _call_sync(_client().fetch_open_orders, s)
+
+      async def create_order(symbol: str, side: str, type: str, amount: float, price: Optional[float] = None, leverage: Optional[float] = None, params: Optional[Dict[str, Any]] = None) -> Any:
+          s = to_kraken_symbol(symbol)
+          p = params.copy() if params else {}
+          if leverage:
+              p["leverage"] = str(leverage)  # Kraken margin param; enables short if side="sell" with leverage
+          return await _call_sync(_client().create_order, s, type, side, amount, price, p)
+
+      async def cancel_order(order_id: str, symbol: Optional[str] = None) -> Any:
+          if symbol:
+              symbol = to_kraken_symbol(symbol)
+          return await _call_sync(_client().cancel_order, order_id, symbol)
+
+  # -------------------------------
+  # 🐙 Kraken: public WS v2 client
+  # -------------------------------
+  - path: backend_py/ws/kraken_ws.py
+    language: python
+    description: "Public WS client for Kraken Spot v2; reconnect with backoff; BTC→XBT symbol mapping"
+    content: |
+      import asyncio, json, random
+      import websockets
+      from typing import List, Dict, Any, Callable, Optional
+
+      WS_URL = "wss://ws.kraken.com/v2"
+
+      def map_symbol(sym: str) -> str:
+          # "BTC/USDT" → "XBT/USDT"
+          return sym.replace("BTC/", "XBT/") if sym else sym
+
+      async def connect_and_subscribe(channels: Dict[str, List[str]], on_message: Callable[[Dict[str, Any]], None], stop: asyncio.Event):
+          backoff = 0.5
+          while not stop.is_set():
+              try:
+                  async with websockets.connect(WS_URL, ping_interval=25) as ws:
+                      # Subscribe
+                      for ch, symbols in channels.items():
+                          if not symbols: continue
+                          payload = {
+                              "method": "subscribe",
+                              "params": {"channel": ch, "symbol": [map_symbol(s) for s in symbols]},
+                          }
+                          await ws.send(json.dumps(payload))
+                      # Listen
+                      async for msg in ws:
+                          try:
+                              data = json.loads(msg)
+                              on_message(data)
+                          except Exception:
+                              pass
+              except Exception:
+                  await asyncio.sleep(min(15.0, backoff + random.random() * 0.25))
+                  backoff = min(15.0, backoff * 2)
+
+  # -------------------------------
+  # 🐙 Kraken: FastAPI REST routes
+  # -------------------------------
+  - path: backend_py/api/routes_kraken.py
+    language: python
+    description: "FastAPI routes exposing ccxt.kraken operations (ticker, balances, orders)"
+    content: |
+      from fastapi import APIRouter, Depends, Query, Body, HTTPException
+      from pydantic import BaseModel
+      from typing import Optional
+      from .middleware_auth import require_user
+      from backend_py.adapters.kraken import fetch_balance, fetch_ticker, fetch_open_orders, create_order, cancel_order
+
+      kr = APIRouter(prefix="/api/crypto/kraken", tags=["kraken"])
+
+      class OrderPayload(BaseModel):
+          symbol: str
+          side: str
+          type: str         # "market" | "limit"
+          amount: float
+          price: float | None = None
+          leverage: float | None = None
+
+      @kr.get("/balances")
+      async def balances(user=Depends(require_user)):
+          return await fetch_balance()
+
+      @kr.get("/ticker")
+      async def ticker(symbol: str, user=Depends(require_user)):
+          return await fetch_ticker(symbol)
+
+      @kr.get("/open_orders")
+      async def open_orders(symbol: Optional[str] = None, user=Depends(require_user)):
+          return await fetch_open_orders(symbol)
+
+      @kr.post("/orders")
+      async def place_order(payload: OrderPayload, user=Depends(require_user)):
+          return await create_order(payload.symbol, payload.side, payload.type, payload.amount, payload.price, payload.leverage)
+
+      @kr.post("/orders/{order_id}/cancel")
+      async def cancel(order_id: str, symbol: Optional[str] = None, user=Depends(require_user)):
+          return await cancel_order(order_id, symbol)
+
+  # -------------------------------
+  # ✅ Twilio SMS (inbound + sender)
+  # -------------------------------
+  - path: backend_py/notif/twilio_sms.py
+    language: python
+    description: "Twilio sender + signature validation helper"
+    content: |
+      import os
+      from typing import Dict
+      from twilio.rest import Client
+      from twilio.request_validator import RequestValidator
+
+      def _client() -> Client:
+          return Client(os.getenv("TWILIO_SID"), os.getenv("TWILIO_TOKEN"))
+
+      def send_sms(to: str, text: str) -> Dict[str, str]:
+          from_num = os.getenv("TWILIO_FROM")
+          msg = _client().messages.create(to=to, from_=from_num, body=text)
+          return {"sid": msg.sid}
+
+      def validate_twilio_signature(url: str, body: Dict[str, str], signature_header: str) -> bool:
+          validator = RequestValidator(os.getenv("TWILIO_TOKEN"))
+          return validator.validate(url, body, signature_header)
+
+  - path: backend_py/llm/chat_gateway.py
+    language: python
+    description: "Unified chat gateway (Twilio/Slack/REST) → Llama-13 with per-domain RAG routing"
+    content: |
+      from typing import Optional, Dict
+      import time
+      from backend_py.core.rag_index import query_rag
+
+      def _detect_domain(q: str) -> str:
+          s = q.lower()
+          if any(k in s for k in ["match","set","game","atp","wta","serve","tennis"]):
+              return "tennis"
+          if any(k in s for k in ["btc","eth","crypto","coin","spread","binance","kraken"]):
+              return "crypto"
+          return "general"
+
+      def answer(question: str, user_id: Optional[str] = None, meta: Optional[Dict] = None) -> Dict:
+          domain = _detect_domain(question)
+          start = time.time()
+          ans = query_rag(question, domain=domain)  # delegates to proper index + generator
+          return {
+            "domain": domain,
+            "latency_ms": int((time.time() - start) * 1000),
+            "answer": ans.get("text",""),
+            "sources": ans.get("sources",[])
+          }
+
+  - path: backend_py/api/routes_twilio.py
+    language: python
+    description: "Twilio inbound webhook → validate → chat_gateway → reply"
+    content: |
+      from fastapi import APIRouter, Request, HTTPException
+      from typing import Dict
+      import os
+      from backend_py.notif.twilio_sms import validate_twilio_signature, send_sms
+      from backend_py.llm.chat_gateway import answer
+
+      tw = APIRouter(prefix="/notify/twilio", tags=["twilio"])
+
+      @tw.post("/inbound")
+      async def inbound(request: Request):
+          form = dict((await request.form()).items())
+          # Twilio posts to the public URL; we need the full URL for signature validation:
+          full_url = str(request.url)
+          sig = request.headers.get("X-Twilio-Signature", "")
+          if not validate_twilio_signature(full_url, form, sig):
+              raise HTTPException(status_code=401, detail="Invalid Twilio signature")
+
+          from_num = form.get("From")
+          body = form.get("Body","").strip()
+          if not from_num or not body:
+              raise HTTPException(status_code=400, detail="Missing From/Body")
+
+          resp = answer(body, user_id=from_num)
+          text = resp.get("answer") or "No answer"
+          send_sms(to=from_num, text=text[:1400])  # SMS-safe truncation
+          return {"ok": True, "domain": resp["domain"], "latency_ms": resp["latency_ms"]}
+
+  # -------------------------------
+  # ✅ Slack bot (DM-first)
+  # -------------------------------
+  - path: backend_py/api/routes_slack.py
+    language: python
+    description: "Slack Events/Commands → chat_gateway; supports subscriptions"
+    content: |
+      from fastapi import APIRouter, Request
+      from slack_sdk.web.async_client import AsyncWebClient
+      import os, json
+      from backend_py.llm.chat_gateway import answer
+
+      sl = APIRouter(prefix="/notify/slack", tags=["slack"])
+      _client = AsyncWebClient(token=os.getenv("SLACK_BOT_TOKEN"))
+
+      async def _post_dm(user: str, text: str):
+          # open IM, then post
+          conv = await _client.conversations_open(users=[user])
+          chan = conv["channel"]["id"]
+          await _client.chat_postMessage(channel=chan, text=text)
+
+      @sl.post("/events")
+      async def events(req: Request):
+          body = await req.json()
+          # Slack URL verification challenge
+          if body.get("type") == "url_verification":
+              return {"challenge": body.get("challenge")}
+          event = body.get("event", {})
+          if event.get("type") == "app_mention" or event.get("channel_type") == "im":
+              user = event.get("user")
+              text = event.get("text","")
+              resp = answer(text, user_id=user)
+              await _post_dm(user, resp.get("answer","(no answer)"))
+          return {"ok": True}
+
+      @sl.post("/command")
+      async def command(req: Request):
+          form = dict((await req.form()).items())
+          cmd = form.get("command","")
+          user = form.get("user_id")
+          text = form.get("text","").strip()
+          if cmd in ("/edge","/chat"):
+              resp = answer(text, user_id=user)
+              await _post_dm(user, resp.get("answer","(no answer)"))
+          # /subscribe, /unsubscribe could store channel prefs in DB (not shown)
+          return {"response_type":"ephemeral","text":"OK"}
+
+  # -------------------------------
+  # ✅ Settings loader (ENV→DB precedence)
+  # -------------------------------
+  - path: backend_py/utils/settings_loader.py
+    language: python
+    description: "Load ENV, then overlay DB values per-field without mutating DB"
+    content: |
+      import os, json
+      from typing import Dict, Any
+      from backend_py.db import models
+
+      def load_settings() -> Dict[str, Any]:
+          env_cfg = {}  # load from os.environ or dotenv if desired
+          for k, v in os.environ.items():
+              env_cfg[k] = v
+          db_cfg = models.load_global_config()  # should return nested dict
+          # Field-by-field overlay: DB overrides ENV where present
+          def deep_merge(base: Dict[str, Any], override: Dict[str, Any]):
+              for k, v in override.items():
+                  if isinstance(v, dict) and isinstance(base.get(k), dict):
+                      deep_merge(base[k], v)
+                  else:
+                      base[k] = v
+          runtime = {}
+          # For brevity, assume models.load_env_struct() exists or map env_cfg → structure elsewhere.
+          runtime = models.load_env_struct(env_cfg)
+          deep_merge(runtime, db_cfg or {})
+          return runtime
+
+  # -------------------------------
+  # ✅ SQL SCRIPTS (Grok request)
+  # -------------------------------
+  - path: scripts/sql/001_core.sql
+    language: sql
+    description: "Core schema, enums, base tables"
+    content: |
+      -- Extensions
+      CREATE EXTENSION IF NOT EXISTS pgcrypto;
+      CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+      CREATE EXTENSION IF NOT EXISTS vector;
+
+      -- Enums
+      DO $$ BEGIN
+        CREATE TYPE role_enum AS ENUM ('STANDARD','PREMIUM','ADMIN','ROOT');
+      EXCEPTION WHEN duplicate_object THEN NULL END $$;
+
+      DO $$ BEGIN
+        CREATE TYPE verify_purpose_enum AS ENUM ('EMAIL_VERIFY','RESET');
+      EXCEPTION WHEN duplicate_object THEN NULL END $$;
+
+      DO $$ BEGIN
+        CREATE TYPE domain_enum AS ENUM ('crypto','tennis');
+      EXCEPTION WHEN duplicate_object THEN NULL END $$;
+
+      DO $$ BEGIN
+        CREATE TYPE bar_enum AS ENUM ('1m','5m','15m','1h','1d');
+      EXCEPTION WHEN duplicate_object THEN NULL END $$;
+
+      DO $$ BEGIN
+        CREATE TYPE algo_enum AS ENUM (
+          'td3','ppo','sac','dt','stat_arb','crypto_vae','gnn_forecaster','lag_llama',
+          'xgb','lstm','sarima','prophet','llm_explainer_rag','benter_adjust','tennis_benter_logit','multi_agent_coordinator'
+        );
+      EXCEPTION WHEN duplicate_object THEN NULL END $$;
+
+      DO $$ BEGIN
+        CREATE TYPE bot_status_enum AS ENUM ('DRAFT','TRAINED','PAPER','LIVE','PAUSED');
+      EXCEPTION WHEN duplicate_object THEN NULL END $$;
+
+      DO $$ BEGIN
+        CREATE TYPE stage_enum AS ENUM ('train','backtest','paper','live');
+      EXCEPTION WHEN duplicate_object THEN NULL END $$;
+
+      DO $$ BEGIN
+        CREATE TYPE run_status_enum AS ENUM ('PENDING','RUNNING','SUCCEEDED','FAILED');
+      EXCEPTION WHEN duplicate_object THEN NULL END $$;
+
+      DO $$ BEGIN
+        CREATE TYPE trade_side_enum AS ENUM ('LONG','SHORT','FLAT','BET');
+      EXCEPTION WHEN duplicate_object THEN NULL END $$;
+
+      DO $$ BEGIN
+        CREATE TYPE paper_live_enum AS ENUM ('PAPER','LIVE');
+      EXCEPTION WHEN duplicate_object THEN NULL END $$;
+
+      DO $$ BEGIN
+        CREATE TYPE notif_channel_enum AS ENUM ('SLACK','EMAIL','SMS');
+      EXCEPTION WHEN duplicate_object THEN NULL END $$;
+
+      DO $$ BEGIN
+        CREATE TYPE withdraw_status_enum AS ENUM ('PENDING','APPROVED','REJECTED','SENT');
+      EXCEPTION WHEN duplicate_object THEN NULL END $$;
+
+      -- Users
+      CREATE TABLE IF NOT EXISTS users (
+        id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+        email text NOT NULL UNIQUE,
+        password_hash text NOT NULL,
+        password_history jsonb,
+        password_last_changed_at timestamptz,
+        name text NOT NULL,
+        role role_enum NOT NULL DEFAULT 'STANDARD',
+        phone text,
+        twofa_enabled boolean NOT NULL DEFAULT false,
+        email_verified_at timestamptz,
+        oauth_provider text,
+        oauth_subject text,
+        created_at timestamptz NOT NULL DEFAULT now()
+      );
+
+      -- Verification tokens
+      CREATE TABLE IF NOT EXISTS verification_tokens (
+        id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        token text NOT NULL,
+        purpose verify_purpose_enum NOT NULL,
+        expires_at timestamptz NOT NULL,
+        used_at timestamptz
+      );
+
+      -- Global config tables
+      CREATE TABLE IF NOT EXISTS global_config_settings (
+        id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+        key text NOT NULL UNIQUE,
+        value_json jsonb NOT NULL,
+        encrypted boolean NOT NULL DEFAULT false,
+        updated_at timestamptz NOT NULL DEFAULT now()
+      );
+
+      CREATE TABLE IF NOT EXISTS crypto_global_settings (
+        id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+        settings_json jsonb NOT NULL,
+        updated_at timestamptz NOT NULL DEFAULT now()
+      );
+
+      CREATE TABLE IF NOT EXISTS tennis_global_settings (
+        id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+        settings_json jsonb NOT NULL,
+        updated_at timestamptz NOT NULL DEFAULT now()
+      );
+
+      -- Datasets & features
+      CREATE TABLE IF NOT EXISTS datasets (
+        id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+        name text NOT NULL,
+        domain domain_enum NOT NULL,
+        bar bar_enum NOT NULL,
+        start timestamptz NOT NULL,
+        end timestamptz NOT NULL,
+        path_parquet text NOT NULL,
+        features_schema jsonb,
+        created_at timestamptz NOT NULL DEFAULT now()
+      );
+
+      CREATE TABLE IF NOT EXISTS feature_catalog (
+        id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+        dataset_id uuid NOT NULL REFERENCES datasets(id) ON DELETE CASCADE,
+        indicators jsonb,
+        pacf_summary jsonb,
+        rfe_rankings jsonb,
+        vif_scores jsonb,
+        pca_summary jsonb,
+        lag_grid_spec jsonb,
+        scaler text,
+        created_at timestamptz NOT NULL DEFAULT now()
+      );
+
+      -- Models
+      CREATE TABLE IF NOT EXISTS models (
+        id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+        algo algo_enum NOT NULL,
+        domain domain_enum NOT NULL,
+        horizon text NOT NULL,
+        path_artifact text NOT NULL,
+        metrics jsonb,
+        preprocess jsonb,
+        created_at timestamptz NOT NULL DEFAULT now(),
+        version_tag text
+      );
+
+      CREATE TABLE IF NOT EXISTS model_families (
+        id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+        name text NOT NULL,
+        domain text NOT NULL,
+        created_at timestamptz NOT NULL DEFAULT now()
+      );
+
+      CREATE TABLE IF NOT EXISTS model_versions (
+        id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+        family_id uuid NOT NULL REFERENCES model_families(id) ON DELETE CASCADE,
+        model_id uuid NOT NULL REFERENCES models(id) ON DELETE CASCADE,
+        version text NOT NULL,
+        created_at timestamptz NOT NULL DEFAULT now(),
+        notes text
+      );
+
+      CREATE TABLE IF NOT EXISTS model_artifacts (
+        id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+        model_id uuid NOT NULL REFERENCES models(id) ON DELETE CASCADE,
+        kind text NOT NULL,
+        path text NOT NULL,
+        version text,
+        created_at timestamptz NOT NULL DEFAULT now(),
+        meta jsonb
+      );
+
+      -- Bots & runs
+      CREATE TABLE IF NOT EXISTS bots (
+        id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+        name text NOT NULL,
+        domain domain_enum NOT NULL,
+        config_json jsonb,
+        status bot_status_enum NOT NULL DEFAULT 'DRAFT',
+        created_at timestamptz NOT NULL DEFAULT now(),
+        updated_at timestamptz NOT NULL DEFAULT now(),
+        slack_webhook_url text,
+        slack_channel text
+      );
+
+      CREATE TABLE IF NOT EXISTS bot_runs (
+        id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+        bot_id uuid NOT NULL REFERENCES bots(id) ON DELETE CASCADE,
+        stage stage_enum NOT NULL,
+        start_ts timestamptz NOT NULL DEFAULT now(),
+        end_ts timestamptz,
+        status run_status_enum NOT NULL DEFAULT 'PENDING',
+        logs_uri text,
+        metrics jsonb,
+        kpis jsonb
+      );
+
+      -- Trades
+      CREATE TABLE IF NOT EXISTS trades (
+        id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+        bot_id uuid NOT NULL REFERENCES bots(id) ON DELETE CASCADE,
+        venue text NOT NULL,
+        symbol text NOT NULL,
+        side trade_side_enum NOT NULL,
+        qty numeric NOT NULL CHECK (qty >= 0),
+        entry_ts timestamptz NOT NULL,
+        exit_ts timestamptz,
+        entry_px numeric NOT NULL,
+        exit_px numeric,
+        pnl numeric,
+        fees_bps numeric,
+        spread_bps numeric,
+        slippage_bps numeric,
+        borrow_bps numeric,
+        paper_live paper_live_enum NOT NULL,
+        meta jsonb
+      );
+
+      -- Router decisions
+      CREATE TABLE IF NOT EXISTS router_decisions (
+        id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+        ts timestamptz NOT NULL DEFAULT now(),
+        symbol text NOT NULL,
+        side text NOT NULL,
+        expected_cost_bps numeric NOT NULL,
+        venue_rankings jsonb NOT NULL,
+        chosen_venue text NOT NULL,
+        realized_cost_bps numeric,
+        cost_delta_bps numeric,
+        failover_count_24h integer,
+        failover_reason text,
+        health jsonb,
+        meta jsonb
+      );
+
+      -- Notifications
+      CREATE TABLE IF NOT EXISTS notifications (
+        id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+        channel notif_channel_enum NOT NULL,
+        user_id uuid REFERENCES users(id) ON DELETE SET NULL,
+        ts timestamptz NOT NULL DEFAULT now(),
+        subject text NOT NULL,
+        body text NOT NULL,
+        status text NOT NULL
+      );
+
+      -- Wallets & Withdrawals
+      CREATE TABLE IF NOT EXISTS wallets (
+        id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        venue text NOT NULL,
+        asset text NOT NULL,
+        balance numeric NOT NULL DEFAULT 0,
+        updated_at timestamptz NOT NULL DEFAULT now(),
+        UNIQUE (user_id, venue, asset)
+      );
+
+      CREATE TABLE IF NOT EXISTS withdrawal_requests (
+        id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        venue text NOT NULL,
+        asset text NOT NULL,
+        amount numeric NOT NULL,
+        address text NOT NULL,
+        status withdraw_status_enum NOT NULL DEFAULT 'PENDING',
+        created_at timestamptz NOT NULL DEFAULT now(),
+        approved_at timestamptz,
+        tx_id text,
+        meta jsonb
+      );
+
+  - path: scripts/sql/002_indexes.sql
+    language: sql
+    description: "Secondary indexes"
+    content: |
+      CREATE INDEX IF NOT EXISTS idx_users_role ON users(role);
+      CREATE INDEX IF NOT EXISTS idx_datasets_domain_bar_start ON datasets(domain, bar, start);
+      CREATE INDEX IF NOT EXISTS idx_bots_domain_status ON bots(domain, status);
+      CREATE INDEX IF NOT EXISTS idx_trades_bot_symbol_entry ON trades(bot_id, symbol, entry_ts);
+      CREATE INDEX IF NOT EXISTS idx_router_decisions_ts_symbol ON router_decisions(ts, symbol);
+      CREATE INDEX IF NOT EXISTS idx_withdrawals_user_status ON withdrawal_requests(user_id, status);
+
+  - path: scripts/sql/003_odds.sql
+    language: sql
+    description: "Tennis entities"
+    content: |
+      DO $$ BEGIN
+        CREATE TYPE surface_enum AS ENUM ('hard','clay','grass','indoor');
+      EXCEPTION WHEN duplicate_object THEN NULL END $$;
+
+      DO $$ BEGIN
+        CREATE TYPE window_enum AS ENUM ('L5','L10','SEASON');
+      EXCEPTION WHEN duplicate_object THEN NULL END $$;
+
+      DO $$ BEGIN
+        CREATE TYPE odds_level_enum AS ENUM ('MATCH','SET','GAME');
+      EXCEPTION WHEN duplicate_object THEN NULL END $$;
+
+      DO $$ BEGIN
+        CREATE TYPE market_enum AS ENUM ('MONEYLINE','SET','GAME','OVER_UNDER','PARLAY');
+      EXCEPTION WHEN duplicate_object THEN NULL END $$;
+
+      DO $$ BEGIN
+        CREATE TYPE event_status_enum AS ENUM ('SCHEDULED','LIVE','FINAL');
+      EXCEPTION WHEN duplicate_object THEN NULL END $$;
+
+      CREATE TABLE IF NOT EXISTS players (
+        id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+        name text NOT NULL,
+        hand text,
+        backhand text,
+        country text,
+        dob date,
+        active boolean NOT NULL DEFAULT true
+      );
+      CREATE INDEX IF NOT EXISTS idx_players_name_active ON players(name, active);
+
+      CREATE TABLE IF NOT EXISTS player_elo (
+        id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+        player_id uuid NOT NULL REFERENCES players(id) ON DELETE CASCADE,
+        surface surface_enum,
+        elo numeric NOT NULL,
+        ts timestamptz NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_player_elo_pid_surface_ts ON player_elo(player_id, surface, ts);
+
+      CREATE TABLE IF NOT EXISTS player_stats (
+        id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+        player_id uuid NOT NULL REFERENCES players(id) ON DELETE CASCADE,
+        surface surface_enum,
+        window window_enum NOT NULL,
+        stats_json jsonb NOT NULL,
+        ts timestamptz NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_player_stats_pid_surface_window_ts ON player_stats(player_id, surface, window, ts);
+
+      CREATE TABLE IF NOT EXISTS odds_cache (
+        id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+        event_id uuid NOT NULL,
+        level odds_level_enum NOT NULL,
+        books text[] NOT NULL,
+        odds_json jsonb NOT NULL,
+        ts timestamptz NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_odds_cache_event_level_ts ON odds_cache(event_id, level, ts);
+
+      CREATE TABLE IF NOT EXISTS tennis_events (
+        id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+        tournament text NOT NULL,
+        round text,
+        player_a text NOT NULL,
+        player_b text NOT NULL,
+        surface surface_enum,
+        start_ts timestamptz NOT NULL,
+        status event_status_enum NOT NULL DEFAULT 'SCHEDULED',
+        source text NOT NULL,
+        odds_cache_key text NOT NULL,
+        odds_levels_json jsonb
+      );
+      CREATE INDEX IF NOT EXISTS idx_tennis_events_start_status ON tennis_events(start_ts, status);
+
+      CREATE TABLE IF NOT EXISTS tennis_bets (
+        id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+        event_id uuid NOT NULL REFERENCES tennis_events(id) ON DELETE CASCADE,
+        selection text NOT NULL,
+        market market_enum NOT NULL,
+        legs jsonb,
+        model_prob numeric,
+        market_fair_prob numeric,
+        benter_prob numeric,
+        price_offered numeric,
+        kelly_frac numeric,
+        stake numeric,
+        result text NOT NULL DEFAULT 'PENDING',
+        payout numeric,
+        meta jsonb
+      );
+
+  - path: scripts/sql/004_graphs.sql
+    language: sql
+    description: "Graph snapshots, forecasts, embeddings (pgvector=384 dims)"
+    content: |
+      CREATE TABLE IF NOT EXISTS graph_snapshots (
+        id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+        ts timestamptz NOT NULL DEFAULT now(),
+        graph_meta jsonb,
+        adj_hash text,
+        node_features_hash text,
+        nodes_schema jsonb,
+        edges_schema jsonb
+      );
+
+      CREATE TABLE IF NOT EXISTS gnn_forecasts (
+        id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+        ts timestamptz NOT NULL DEFAULT now(),
+        horizon text NOT NULL,
+        symbols text[] NOT NULL,
+        quantiles jsonb,
+        metrics jsonb,
+        meta jsonb
+      );
+
+      -- Embeddings (choose 384 to match MiniLM-L6-v2)
+      CREATE TABLE IF NOT EXISTS tennis_match_embeddings (
+        id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+        event_id uuid NOT NULL,
+        player_a text NOT NULL,
+        player_b text NOT NULL,
+        surface text,
+        tournament text,
+        round text,
+        ts timestamptz NOT NULL,
+        granularity text NOT NULL,
+        vector vector(384) NOT NULL,
+        meta jsonb
+      );
+      CREATE INDEX IF NOT EXISTS idx_tennis_match_embeddings_event_gran_ts ON tennis_match_embeddings(event_id, granularity, ts);
+      CREATE INDEX IF NOT EXISTS ivf_tennis_match_embeddings ON tennis_match_embeddings USING ivfflat (vector) WITH (lists = 100);
+
+      CREATE TABLE IF NOT EXISTS crypto_symbol_embeddings (
+        id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+        symbol text NOT NULL,
+        date date NOT NULL,
+        granularity text NOT NULL,
+        vector vector(384) NOT NULL,
+        meta jsonb
+      );
+      CREATE INDEX IF NOT EXISTS idx_crypto_symbol_embeddings ON crypto_symbol_embeddings(symbol, date, granularity);
+      CREATE INDEX IF NOT EXISTS ivf_crypto_symbol_embeddings ON crypto_symbol_embeddings USING ivfflat (vector) WITH (lists = 100);
+
+  - path: scripts/sql/005_settings.sql
+    language: sql
+    description: "Helpers + seed (minimal)"
+    content: |
+      -- Upsert function for global_config_settings
+      CREATE OR REPLACE FUNCTION upsert_global_setting(k text, v jsonb, enc boolean DEFAULT false)
+      RETURNS void AS $$
+      BEGIN
+        INSERT INTO global_config_settings(key, value_json, encrypted, updated_at)
+        VALUES (k, v, enc, now())
+        ON CONFLICT (key) DO UPDATE
+          SET value_json = EXCLUDED.value_json,
+              encrypted = EXCLUDED.encrypted,
+              updated_at = now();
+      END;
+      $$ LANGUAGE plpgsql;
+
+      -- Minimal seeds (optional)
+      SELECT upsert_global_setting('auth', '{"two_factor": true}'::jsonb, false);
+
+  - path: scripts/sql/006_ops.sql
+    language: sql
+    description: "Idempotency keys + API audit log (ops)"
+    content: |
+      -- Idempotency keys for POST endpoints (jobs/orders/etc.)
+      CREATE TABLE IF NOT EXISTS idempotency_keys (
+        id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+        key text NOT NULL UNIQUE,
+        first_seen_at timestamptz NOT NULL DEFAULT now(),
+        method text NOT NULL,
+        path text NOT NULL,
+        request_hash text NOT NULL,
+        response_json jsonb,
+        status_code integer,
+        ttl_sec integer NOT NULL DEFAULT 86400
+      );
+      CREATE INDEX IF NOT EXISTS idx_idem_key_first_seen ON idempotency_keys(first_seen_at);
+      -- Simple API audit log
+      CREATE TABLE IF NOT EXISTS api_audit_log (
+        id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+        ts timestamptz NOT NULL DEFAULT now(),
+        user_id uuid,
+        method text NOT NULL,
+        path text NOT NULL,
+        status_code integer NOT NULL,
+        ip text,
+        meta jsonb
+      );
+      CREATE INDEX IF NOT EXISTS idx_api_audit_ts ON api_audit_log(ts);
+
+  # -------------------------------
+  # ✅ Tests
+  # -------------------------------
+  - path: backend_py/tests/test_robinhood_adapter.py
+    language: python
+    description: "Tests for Ed25519 signing and string-to-sign formation"
+    content: |
+      import base64, asyncio, json
+      import pytest
+      from backend_py.adapters.robinhood_crypto import RobinhoodCryptoAdapter, RHConfig, _json_stable
+
+      TEST_SEED = bytes(range(32))
+      TEST_SEED_B64 = base64.b64encode(TEST_SEED).decode()
+
+      @pytest.mark.asyncio
+      async def test_json_stable():
+          obj = {"b":2,"a":[3,1]}
+          s = _json_stable(obj)
+          assert s == '{"a":[3,1],"b":2}'
+
+      @pytest.mark.asyncio
+      async def test_sign_and_headers(monkeypatch):
+          cfg = RHConfig(api_key="test_api", private_key_b64=TEST_SEED_B64, base_url="https://example.com")
+          adp = RobinhoodCryptoAdapter(cfg)
+          monkeypatch.setattr("time.time", lambda: 1700000000)
+          body = {"client_order_id":"123","side":"buy","type":"market","symbol":"BTC-USD","market_order_config":{"asset_quantity":"0.001"}}
+          body_str = json.dumps(body, separators=(",",":"), sort_keys=True)
+          headers = adp._sign("POST", "/api/v1/crypto/trading/orders/", body_str)
+          assert headers["x-api-key"] == "test_api"
+          assert headers["x-timestamp"] == str(1700000000)
+          assert len(headers["x-signature"]) == 88
+
+      @pytest.mark.asyncio
+      async def test_symbol_mapping():
+          assert RobinhoodCryptoAdapter.to_rh_symbol("BTC/USDT") == "BTC-USD"
+          assert RobinhoodCryptoAdapter.from_rh_symbol("ETH-USD") == "ETH/USDT"
+
+  - path: backend_py/tests/test_granularity_enums.py
+    language: python
+    description: "Guard against accidental enum typos"
+    content: |
+      def test_granularity_enums():
+          tennis = {"HOURLY","DAILY","WEEKLY","MONTHLY"}
+          crypto = {"HOURLY","DAILY","WEEKLY","MONTHLY"}
+          assert "WEBSITE" not in tennis
+          assert "WEBSITE" not in crypto
+
+  - path: backend_py/tests/test_kraken_adapter.py
+    language: python
+    description: "Kraken symbol mapping + create_order param smoke (monkeypatched)"
+    content: |
+      import pytest
+      import backend_py.adapters.kraken as K
+
+      def test_symbol_map():
+          assert K.to_kraken_symbol("BTC/USDT") == "XBT/USDT"
+          assert K.to_kraken_symbol("ETH/USDT") == "ETH/USDT"
+
+      @pytest.mark.asyncio
+      async def test_create_order_build(monkeypatch):
+          called = {}
+          class Dummy:
+              def create_order(self, symbol, type, side, amount, price=None, params=None):
+                  called["symbol"]=symbol; called["type"]=type; called["side"]=side; called["amount"]=amount; called["price"]=price; called["params"]=params or {}
+                  return {"id":"abc"}
+          monkeypatch.setattr(K, "_client", lambda: Dummy())
+          res = await K.create_order("BTC/USDT","sell","limit",0.01, 20000.0, leverage=3)
+          assert called["symbol"] == "XBT/USDT"
+          assert called["params"].get("leverage") == "3"
+          assert res["id"] == "abc"
